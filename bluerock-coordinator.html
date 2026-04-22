@@ -1,0 +1,2580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bluerock Property Management</title>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-messaging-compat.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.js"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useContext, createContext, useRef } = React;
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const COLORS = {
+  navy:"#0A1628", blue:"#1B4FD8", lightBlue:"#3B82F6", sky:"#E8F0FE",
+  white:"#FFFFFF", slate:"#64748B", green:"#10B981", amber:"#F59E0B",
+  red:"#EF4444", surface:"#F8FAFF", border:"#E2E8F0",
+};
+const FONT    = "'DM Sans', sans-serif";
+const DISPLAY = "'DM Serif Display', serif";
+const PROP_COLORS = ["#1B4FD8","#7C3AED","#059669","#DC2626","#D97706","#0891B2","#DB2777","#B45309"];
+const OWNER_EMAILS = ["moemustapha123@hotmail.com","khaled_elkhodeir@hotmail.com"];
+const CHECKLIST    = ["Toilet paper","Paper towels","Dish soap","Hand soap","Shampoo","Conditioner","Trash bags","Laundry pods","Coffee pods","Sponges","Dryer sheets","Bath towels","Kitchen towels"];
+const CHECK_TIMES  = ["8:00 AM","9:00 AM","10:00 AM","11:00 AM","12:00 PM","1:00 PM","2:00 PM","3:00 PM","4:00 PM","5:00 PM","6:00 PM"];
+const MAINT_CATS   = ["Plumbing","Electrical","Appliance","HVAC","Furniture","Doors & Windows","Exterior","Other"];
+const urgencyCfg   = {
+  low:    {label:"Low",       bg:"#F0FDF4",color:"#166534"},
+  medium: {label:"Medium",    bg:"#FFF7ED",color:"#92400E"},
+  urgent: {label:"🚨 Urgent", bg:"#FEE2E2",color:"#991B1B",dot:"#EF4444"},
+};
+const maintStatusCfg = {
+  open:          {label:"Open",         bg:"#FEE2E2",color:"#991B1B",dot:"#EF4444"},
+  scheduled:     {label:"Scheduled",    bg:"#FEF3C7",color:"#92400E",dot:"#F59E0B"},
+  "in-progress": {label:"In Progress",  bg:"#DBEAFE",color:"#1D4ED8",dot:"#3B82F6"},
+  resolved:      {label:"Resolved",     bg:"#D1FAE5",color:"#065F46",dot:"#10B981"},
+};
+const NEXT_MAINT = {open:"scheduled",scheduled:"in-progress","in-progress":"resolved"};
+
+// ─── DB CONTEXT ───────────────────────────────────────────────────────────────
+const DbCtx = createContext(null);
+
+// ─── LOCAL STORAGE (only config + session) ────────────────────────────────────
+const ls   = (k,d) => { try { return JSON.parse(localStorage.getItem(k) ?? JSON.stringify(d)); } catch { return d; } };
+const lsSet = (k,v) => localStorage.setItem(k, JSON.stringify(v));
+const loadSess = ()  => ls("br_session", null);
+const saveSess = v   => lsSet("br_session", v);
+const clearSess = () => localStorage.removeItem("br_session");
+
+const safeKey = s => String(s).replace(/[.#$[\]/]/g, "_").slice(0, 200);
+
+// ─── FIREBASE INIT ───────────────────────────────────────────────────────────
+// API key is restricted to this app's domain in Firebase Console → API Keys
+if (firebase.apps.length === 0) firebase.initializeApp({
+  apiKey: "AIzaSyDfQWs3A5DI4i6IKo2llU9pH-zQUF6dbRY",
+  authDomain: "bluerock-property-management.firebaseapp.com",
+  databaseURL: "https://bluerock-property-management-default-rtdb.firebaseio.com",
+  projectId: "bluerock-property-management",
+  storageBucket: "bluerock-property-management.firebasestorage.app",
+  messagingSenderId: "581930721809",
+  appId: "1:581930721809:web:0c02d4d7e383bc5b5e07b0",
+});
+const _db = firebase.database();
+// Enable offline persistence so writes queue when signal is lost
+firebase.database().goOnline();
+
+// ─── ICAL ─────────────────────────────────────────────────────────────────────
+function parseIcal(text) {
+  const events = []; const re = /BEGIN:VEVENT([\s\S]*?)END:VEVENT/g; let m;
+  while ((m = re.exec(text)) !== null) {
+    const b = m[1];
+    const ds = b.match(/DTSTART(?:;[^\r\n:]*)?:(\d{8})/)?.[1];
+    const de = b.match(/DTEND(?:;[^\r\n:]*)?:(\d{8})/)?.[1];
+    const uid = b.match(/UID:([^\r\n]+)/)?.[1]?.trim();
+    if (ds && de) {
+      const fmt = d => `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
+      const start = fmt(ds), end = fmt(de);
+      const nights = Math.round((new Date(end) - new Date(start)) / 86400000);
+      events.push({ start, end, nights, uid: uid || `${ds}_${de}` });
+    }
+  }
+  return events.sort((a,b) => a.start.localeCompare(b.start));
+}
+async function fetchIcal(url) {
+  // 1. Direct (works only if server allows CORS)
+  try { const r = await fetch(url, {mode:"cors"}); if (r.ok) { const t = await r.text(); if (t.includes("BEGIN:VCALENDAR")) return t; } } catch {}
+  // 2. corsproxy.io
+  try {
+    const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`);
+    if (r.ok) { const t = await r.text(); if (t.includes("BEGIN:VCALENDAR")) return t; }
+  } catch {}
+  // 3. allorigins.win
+  try {
+    const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`);
+    if (r.ok) { const d = await r.json(); if (d.contents && d.contents.includes("BEGIN:VCALENDAR")) return d.contents; }
+  } catch {}
+  // 4. thingproxy.freeboard.io
+  try {
+    const r = await fetch(`https://thingproxy.freeboard.io/fetch/${url}`);
+    if (r.ok) { const t = await r.text(); if (t.includes("BEGIN:VCALENDAR")) return t; }
+  } catch {}
+  // 5. api.codetabs.com
+  try {
+    const r = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`);
+    if (r.ok) { const t = await r.text(); if (t.includes("BEGIN:VCALENDAR")) return t; }
+  } catch {}
+  return null;
+}
+
+// ─── IMAGE COMPRESSION ───────────────────────────────────────────────────────
+async function compressImage(file, maxDim=1200, quality=0.75) {
+  return new Promise(res => {
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        res(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+// ─── DATE UTILS ──────────────────────────────────────────────────────────────
+const today   = () => new Date().toISOString().slice(0,10);
+const fmtDate = d => new Date(d + "T12:00:00").toLocaleDateString("en-US", {weekday:"short", month:"short", day:"numeric"});
+const fmtDateLong = d => new Date(d + "T12:00:00").toLocaleDateString("en-US", {weekday:"long", month:"long", day:"numeric", year:"numeric"});
+const stayStatus  = s => { const t = today(); return s.end <= t ? "past" : s.start <= t ? "active" : "upcoming"; };
+const statusColor = st => ({ past:{bg:"#F1F5F9",color:"#64748B"}, active:{bg:"#D1FAE5",color:"#065F46",dot:"#10B981"}, upcoming:{bg:"#DBEAFE",color:"#1D4ED8",dot:"#3B82F6"} }[st]);
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+const jobStatusCfg = {
+  pending:       {label:"Pending",     bg:"#FEF3C7", color:"#D97706", dot:"#F59E0B"},
+  "in-progress": {label:"In Progress", bg:"#DBEAFE", color:"#1D4ED8", dot:"#3B82F6"},
+  complete:      {label:"Complete",    bg:"#D1FAE5", color:"#065F46", dot:"#10B981"},
+};
+const invStatusCfg = {
+  pending:   {label:"Needs Order", bg:"#FEE2E2", color:"#991B1B"},
+  ordered:   {label:"Ordered",     bg:"#FEF3C7", color:"#92400E"},
+  restocked: {label:"Restocked",   bg:"#D1FAE5", color:"#065F46"},
+};
+const getProp  = (id, props) => (props||[]).find(p=>p.id===id) || {name:"Unknown",color:"#94A3B8",checkinTime:"3:00 PM",checkoutTime:"11:00 AM"};
+const objArr   = v => Object.values(v||{}).filter(Boolean);
+
+// ─── PASSWORD HASHING (PBKDF2 via Web Crypto) ────────────────────────────────
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key  = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:100000,hash:"SHA-256"}, key, 256);
+  const toHex = buf => Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  return `pbkdf2:${toHex(salt.buffer)}:${toHex(bits)}`;
+}
+async function verifyPassword(password, stored) {
+  if (!stored || !stored.startsWith("pbkdf2:")) return false;
+  const [,saltHex,hashHex] = stored.split(":");
+  const salt = new Uint8Array(saltHex.match(/.{2}/g).map(b=>parseInt(b,16)));
+  const key  = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:100000,hash:"SHA-256"}, key, 256);
+  const computed = Array.from(new Uint8Array(bits)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  return computed === hashHex;
+}
+
+// ─── TURNOVER TIMER HELPERS ───────────────────────────────────────────────────
+const pad2 = n => String(n).padStart(2,"0");
+
+function parseWindowTime(dateStr, timeStr) {
+  if (!dateStr || !timeStr) return null;
+  const m = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!m) return null;
+  let h = parseInt(m[1]), min = parseInt(m[2]);
+  const ampm = m[3].toUpperCase();
+  if (ampm==="PM" && h!==12) h+=12;
+  if (ampm==="AM" && h===12) h=0;
+  const [y,mo,d] = dateStr.split("-").map(Number);
+  return new Date(y, mo-1, d, h, min, 0).getTime();
+}
+
+function fmtWindowDuration(ms) {
+  if (!ms||ms<=0) return "";
+  const h = Math.floor(ms/3600000), m = Math.floor((ms%3600000)/60000);
+  return h>0 ? `${h}h ${m>0?m+"m ":""}` : `${m}m `;
+}
+
+// ─── UI PRIMITIVES ────────────────────────────────────────────────────────────
+function Badge({config, small}) {
+  return <span style={{display:"inline-flex",alignItems:"center",gap:5,padding:small?"2px 8px":"4px 10px",borderRadius:20,fontSize:small?11:12,fontWeight:600,whiteSpace:"nowrap",background:config.bg,color:config.color}}>
+    {config.dot&&<span style={{width:6,height:6,borderRadius:"50%",background:config.dot,display:"inline-block"}}/>}{config.label}
+  </span>;
+}
+function Avatar({name,size=32}) {
+  const hue = name.charCodeAt(0)*7%360;
+  return <div style={{width:size,height:size,borderRadius:"50%",background:`hsl(${hue},55%,55%)`,color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:size*.38,fontWeight:700,flexShrink:0,letterSpacing:"-.5px"}}>
+    {name.split(" ").map(n=>n[0]).join("").slice(0,2)}
+  </div>;
+}
+function Card({children, style:s, onClick}) {
+  return <div onClick={onClick} style={{background:COLORS.white,borderRadius:16,border:`1px solid ${COLORS.border}`,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",padding:20,cursor:onClick?"pointer":"default",transition:"box-shadow 0.15s,transform 0.15s",...s}}
+    onMouseEnter={e=>{if(onClick){e.currentTarget.style.boxShadow="0 4px 16px rgba(27,79,216,0.13)";e.currentTarget.style.transform="translateY(-1px)";}}}
+    onMouseLeave={e=>{if(onClick){e.currentTarget.style.boxShadow="0 1px 4px rgba(0,0,0,0.06)";e.currentTarget.style.transform="none";}}}>
+    {children}
+  </div>;
+}
+function Btn({children,variant="primary",onClick,small,disabled,style:s}) {
+  const V={primary:{background:COLORS.blue,color:"#fff"},outline:{background:"transparent",color:COLORS.blue,border:`1.5px solid ${COLORS.blue}`},ghost:{background:"transparent",color:COLORS.slate,border:`1.5px solid ${COLORS.border}`},green:{background:COLORS.green,color:"#fff"},amber:{background:COLORS.amber,color:"#fff"},red:{background:COLORS.red,color:"#fff"}};
+  return <button disabled={disabled} onClick={onClick} style={{display:"inline-flex",alignItems:"center",gap:6,padding:small?"6px 14px":"10px 20px",borderRadius:10,fontSize:small?12:14,fontWeight:600,border:"none",cursor:disabled?"not-allowed":"pointer",transition:"all 0.15s",fontFamily:FONT,opacity:disabled?.55:1,...V[variant],...s}}
+    onMouseEnter={e=>{if(!disabled){e.currentTarget.style.opacity=".82";e.currentTarget.style.transform="translateY(-1px)";}}}
+    onMouseLeave={e=>{e.currentTarget.style.opacity=disabled?".55":"1";e.currentTarget.style.transform="none";}}>
+    {children}
+  </button>;
+}
+function Modal({children,onClose,wide}) {
+  return <div style={{position:"fixed",inset:0,background:"rgba(10,22,40,0.55)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:20}} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+    <div style={{background:COLORS.white,borderRadius:20,padding:28,width:"100%",maxWidth:wide?700:520,maxHeight:"88vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.25)",animation:"slideUp 0.18s ease"}}>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:4}}>
+        <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",fontSize:22,color:COLORS.slate,lineHeight:1}}>×</button>
+      </div>
+      {children}
+    </div>
+  </div>;
+}
+function FieldInput({label,type="text",value,onChange,placeholder,onKeyDown}) {
+  return <div>
+    <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>{label}</label>
+    <input type={type} value={value} onChange={onChange} placeholder={placeholder} onKeyDown={onKeyDown}
+      style={{width:"100%",padding:"10px 14px",borderRadius:10,border:`1.5px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13,boxSizing:"border-box",outline:"none"}}/>
+  </div>;
+}
+function ErrBox({msg}) { return msg?<div style={{background:"#FEE2E2",color:"#991B1B",padding:"10px 14px",borderRadius:8,fontSize:13,marginBottom:14}}>{msg}</div>:null; }
+function Tabs({tabs,active,onChange}) {
+  return <div style={{display:"flex",gap:4,background:COLORS.sky,padding:4,borderRadius:12,marginBottom:24}}>
+    {tabs.map(t=><button key={t.id} onClick={()=>onChange(t.id)} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",cursor:"pointer",fontFamily:FONT,fontWeight:600,fontSize:13,background:active===t.id?COLORS.white:"transparent",color:active===t.id?COLORS.blue:COLORS.slate,boxShadow:active===t.id?"0 1px 4px rgba(0,0,0,0.08)":"none",transition:"all 0.15s",display:"flex",alignItems:"center",justifyContent:"center",gap:5,position:"relative"}}>
+      <span>{t.icon}</span>{t.label}
+      {t.badge>0&&<span style={{background:t.urgent?COLORS.red:COLORS.amber,color:"#fff",fontSize:10,fontWeight:700,padding:"1px 5px",borderRadius:20,minWidth:16,textAlign:"center"}}>{t.badge}</span>}
+    </button>)}
+  </div>;
+}
+
+// ─── AUTH SHELL ───────────────────────────────────────────────────────────────
+function AuthShell({children}) {
+  return <div style={{minHeight:"100vh",background:"#EEF2FF",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+    <div style={{background:COLORS.white,borderRadius:20,padding:40,width:"100%",maxWidth:420,boxShadow:"0 8px 40px rgba(27,79,216,0.12)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:32}}>
+        <div style={{width:40,height:40,borderRadius:12,background:COLORS.navy,display:"flex",alignItems:"center",justifyContent:"center"}}>
+          <span style={{color:"#fff",fontSize:18,fontWeight:800}}>B</span>
+        </div>
+        <div><div style={{fontWeight:800,fontSize:18,color:COLORS.navy,fontFamily:DISPLAY}}>Bluerock</div><div style={{fontSize:11,color:COLORS.slate}}>Property Management</div></div>
+      </div>
+      {children}
+    </div>
+  </div>;
+}
+
+function LoginScreen({onLogin,onGoSignup}) {
+  const db = useContext(DbCtx);
+  const [email,setEmail]=useState(""); const [pass,setPass]=useState(""); const [err,setErr]=useState("");
+  const handle = async () => {
+    const snap = await db.ref("accounts").orderByChild("email").equalTo(email.trim().toLowerCase()).once("value");
+    const accounts = Object.values(snap.val()||{});
+    let acc = null;
+    for (const a of accounts) {
+      const hashed = a.password?.startsWith("pbkdf2:");
+      if (hashed) {
+        if (await verifyPassword(pass, a.password)) { acc = a; break; }
+      } else if (a.password === pass) {
+        // Plain-text legacy account — verify then migrate to hash
+        acc = a;
+        const newHash = await hashPassword(pass);
+        await db.ref(`accounts/${a.id}/password`).set(newHash);
+        break;
+      }
+    }
+    if (!acc) { setErr("Incorrect email or password."); return; }
+    onLogin(acc);
+  };
+  return <AuthShell>
+    <h2 style={{fontFamily:DISPLAY,fontSize:24,color:COLORS.navy,marginBottom:6}}>Welcome back</h2>
+    <p style={{fontSize:13,color:COLORS.slate,marginBottom:24}}>Sign in to your account</p>
+    <ErrBox msg={err}/>
+    <div style={{display:"flex",flexDirection:"column",gap:14}}>
+      <FieldInput label="Email" type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com" onKeyDown={e=>e.key==="Enter"&&handle()}/>
+      <FieldInput label="Password" type="password" value={pass} onChange={e=>setPass(e.target.value)} placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&handle()}/>
+    </div>
+    <Btn onClick={handle} style={{width:"100%",justifyContent:"center",marginTop:20}}>Sign In</Btn>
+    <div style={{textAlign:"center",marginTop:16,fontSize:13,color:COLORS.slate}}>
+      Don't have an account?{" "}<span onClick={onGoSignup} style={{color:COLORS.blue,fontWeight:600,cursor:"pointer"}}>Create one</span>
+    </div>
+  </AuthShell>;
+}
+
+function SignupScreen({onSignup,onGoLogin}) {
+  const db = useContext(DbCtx);
+  const [name,setName]=useState(""); const [email,setEmail]=useState(""); const [pass,setPass]=useState(""); const [confirm,setConfirm]=useState(""); const [role,setRole]=useState(""); const [err,setErr]=useState("");
+  const handle = async () => {
+    if (!name.trim()||!email.trim()||!pass||!role){setErr("Please fill in all fields.");return;}
+    if (pass!==confirm){setErr("Passwords do not match.");return;}
+    if (pass.length<6){setErr("Password must be at least 6 characters.");return;}
+    const snap = await db.ref("accounts").orderByChild("email").equalTo(email.trim().toLowerCase()).once("value");
+    if (snap.val()){setErr("An account with this email already exists.");return;}
+    const isOwner = OWNER_EMAILS.includes(email.trim().toLowerCase());
+    const acc = {id:String(Date.now()),name:name.trim(),email:email.trim().toLowerCase(),password:await hashPassword(pass),role:isOwner?"owner":role,authorized:isOwner};
+    await db.ref(`accounts/${acc.id}`).set(acc);
+    onSignup(acc);
+  };
+  return <AuthShell>
+    <h2 style={{fontFamily:DISPLAY,fontSize:24,color:COLORS.navy,marginBottom:6}}>Create account</h2>
+    <p style={{fontSize:13,color:COLORS.slate,marginBottom:24}}>Join your team on Bluerock</p>
+    <ErrBox msg={err}/>
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      <FieldInput label="Full Name" value={name} onChange={e=>setName(e.target.value)} placeholder="Your name"/>
+      <FieldInput label="Email" type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com"/>
+      <FieldInput label="Password" type="password" value={pass} onChange={e=>setPass(e.target.value)} placeholder="Min. 6 characters"/>
+      <FieldInput label="Confirm Password" type="password" value={confirm} onChange={e=>setConfirm(e.target.value)} placeholder="Repeat password" onKeyDown={e=>e.key==="Enter"&&handle()}/>
+      <div>
+        <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:8}}>I am a...</label>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          {[{value:"manager",label:"Owner / Manager",icon:"🏠",desc:"Full dashboard access"},{value:"cleaner",label:"Cleaner",icon:"🧹",desc:"Cleaning jobs & calendar"},{value:"landscaper",label:"Landscaper",icon:"🌿",desc:"Landscaping schedule"},{value:"garbage",label:"Garbage Collector",icon:"🗑",desc:"Pickup schedule & routes"}].map(r=>(
+            <div key={r.value} onClick={()=>setRole(r.value)} style={{padding:"12px 14px",borderRadius:10,cursor:"pointer",border:`2px solid ${role===r.value?COLORS.blue:COLORS.border}`,background:role===r.value?COLORS.sky:"#fff",transition:"all 0.15s"}}>
+              <div style={{fontSize:20,marginBottom:4}}>{r.icon}</div>
+              <div style={{fontSize:12,fontWeight:700,color:role===r.value?COLORS.blue:COLORS.navy}}>{r.label}</div>
+              <div style={{fontSize:11,color:COLORS.slate,marginTop:2}}>{r.desc}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+    <Btn onClick={handle} style={{width:"100%",justifyContent:"center",marginTop:20}}>Create Account</Btn>
+    <div style={{textAlign:"center",marginTop:16,fontSize:13,color:COLORS.slate}}>
+      Already have an account?{" "}<span onClick={onGoLogin} style={{color:COLORS.blue,fontWeight:600,cursor:"pointer"}}>Sign in</span>
+    </div>
+  </AuthShell>;
+}
+
+function PendingScreen({user,onLogout}) {
+  return <AuthShell>
+    <div style={{textAlign:"center"}}>
+      <div style={{fontSize:48,marginBottom:16}}>⏳</div>
+      <h2 style={{fontFamily:DISPLAY,fontSize:24,color:COLORS.navy,marginBottom:8}}>Awaiting Authorization</h2>
+      <p style={{fontSize:13,color:COLORS.slate,marginBottom:24,lineHeight:1.6}}>Hi <strong>{user.name}</strong>, an owner needs to approve your account before you can access the app.</p>
+      <div style={{background:COLORS.sky,borderRadius:12,padding:"14px 18px",marginBottom:24,fontSize:13,color:COLORS.slate,textAlign:"left"}}>
+        <div>Signed in as <strong>{user.email}</strong></div>
+        <div style={{marginTop:4}}>Role: <strong style={{textTransform:"capitalize"}}>{user.role}</strong></div>
+      </div>
+      <Btn variant="ghost" onClick={onLogout}>Sign out</Btn>
+    </div>
+  </AuthShell>;
+}
+
+// ─── TEAM VIEW ────────────────────────────────────────────────────────────────
+function TeamView({currentUser,accounts,section="cleaning"}) {
+  const db = useContext(DbCtx);
+  const authorize = async id => { await db.ref(`accounts/${id}`).update({authorized:true}); };
+  const revoke    = async id => { await db.ref(`accounts/${id}`).update({authorized:false}); };
+  const remove    = async id => { await db.ref(`accounts/${id}`).remove(); };
+
+  const sectionRoles = section==="landscape" ? ["landscaper"]
+                     : section==="garbage"   ? ["garbage"]
+                     : ["cleaner","manager"];
+  const sectionLabel = section==="landscape" ? "Landscapers"
+                     : section==="garbage"   ? "Garbage Collectors"
+                     : "Cleaners & Managers";
+
+  const pending    = accounts.filter(a=>!a.authorized&&sectionRoles.includes(a.role));
+  const authorized = accounts.filter(a=>a.authorized&&sectionRoles.includes(a.role));
+  const owners     = accounts.filter(a=>a.role==="owner");
+  const roleLabel  = r=>r==="manager"?"Owner / Manager":r==="landscaper"?"Landscaper":r==="garbage"?"Garbage Collector":r.charAt(0).toUpperCase()+r.slice(1);
+  const MemberCard = ({u,children})=>(
+    <Card style={{padding:"14px 18px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:12}}>
+        <Avatar name={u.name} size={38}/>
+        <div style={{flex:1}}>
+          <div style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{u.name}</div>
+          <div style={{fontSize:12,color:COLORS.slate}}>{u.email}</div>
+          <div style={{fontSize:11,color:COLORS.slate,marginTop:2}}>{roleLabel(u.role)}</div>
+        </div>
+        {children}
+      </div>
+    </Card>
+  );
+  return <div>
+    <Card style={{background:"#EEF2FF",border:`1px solid #BFDBFE`,marginBottom:24,padding:"14px 18px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+        <span style={{fontSize:16}}>🔥</span>
+        <div style={{fontWeight:700,fontSize:13,color:COLORS.navy}}>Real-time sync is active</div>
+      </div>
+      <div style={{fontSize:12,color:COLORS.slate}}>All team changes sync instantly across every device — no export/import needed. Anyone who signs up will appear here.</div>
+    </Card>
+
+    {pending.length>0&&<div style={{marginBottom:28}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+        <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,fontFamily:DISPLAY,margin:0}}>Pending Authorization</h3>
+        <span style={{background:COLORS.red,color:"#fff",fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:20}}>{pending.length}</span>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {pending.map(u=><MemberCard key={u.id} u={u}>
+          <Btn small variant="green" onClick={()=>authorize(u.id)}>Authorize</Btn>
+          <Btn small variant="red"   onClick={()=>remove(u.id)}>Delete</Btn>
+        </MemberCard>)}
+      </div>
+    </div>}
+
+    <div style={{marginBottom:28}}>
+      <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,fontFamily:DISPLAY,marginBottom:14}}>{sectionLabel}</h3>
+      {authorized.length===0?<div style={{fontSize:13,color:COLORS.slate}}>No authorized {sectionLabel.toLowerCase()} yet.</div>
+      :<div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {authorized.map(u=><MemberCard key={u.id} u={u}>
+          <Badge config={{label:"Authorized",bg:"#D1FAE5",color:"#065F46"}} small/>
+          <Btn small variant="ghost" onClick={()=>revoke(u.id)}>Revoke</Btn>
+          <Btn small variant="red"   onClick={()=>remove(u.id)}>Remove</Btn>
+        </MemberCard>)}
+      </div>}
+    </div>
+
+    <div>
+      <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,fontFamily:DISPLAY,marginBottom:14}}>Owners</h3>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {owners.length===0?<div style={{fontSize:13,color:COLORS.slate}}>No owners yet.</div>
+        :owners.map(u=><MemberCard key={u.id} u={u}>
+          <Badge config={{label:"Owner",bg:"#DBEAFE",color:"#1D4ED8",dot:"#3B82F6"}} small/>
+          {u.id!==currentUser.id&&<Btn small variant="red" onClick={()=>remove(u.id)}>Remove</Btn>}
+        </MemberCard>)}
+      </div>
+    </div>
+  </div>;
+}
+
+// ─── CALENDAR VIEW ────────────────────────────────────────────────────────────
+function CalendarView({stays,jobs,properties,accounts,currentUser,readOnly}) {
+  const db = useContext(DbCtx);
+  const [addOpen,setAddOpen]     = useState(false);
+  const [editProp,setEditProp]   = useState(null);
+  const [syncing,setSyncing]     = useState({});
+  const [syncRes,setSyncRes]     = useState({});
+  const [pasteText,setPasteText] = useState({});
+
+  // Sort stays newest first for display, split upcoming vs past
+  const staysByProp = propId => {
+    const s = stays.filter(s=>s.propId===propId);
+    s.sort((a,b)=>a.start.localeCompare(b.start));
+    return s;
+  };
+  const jobForStay = (stay) => jobs.find(j=>j.propertyId===stay.propId && j.checkoutDate===stay.end);
+
+  const doSync = async (prop, rawText) => {
+    setSyncing(v=>({...v,[prop.id]:true}));
+    setSyncRes(v=>({...v,[prop.id]:null}));
+    try {
+      let text = rawText;
+      if (!text && prop.icalUrl) text = await fetchIcal(prop.icalUrl);
+      if (!text) throw new Error("Could not fetch calendar via any proxy. Airbnb may be blocking automated requests — use the \"Paste iCal content\" option below instead.");
+      const events = parseIcal(text);
+      if (events.length===0) throw new Error("No bookings found in this calendar.");
+
+      // Save stays to Firebase
+      const staysRef = db.ref(`stays/${prop.id}`);
+      const staysSnap = await staysRef.once("value");
+      const existing = staysSnap.val()||{};
+      let added=0;
+      for (const ev of events) {
+        const k = safeKey(ev.uid);
+        const stayData = {uid:ev.uid,start:ev.start,end:ev.end,nights:ev.nights,propId:prop.id};
+        await staysRef.child(k).set(stayData);
+        // Create cleaning job for each checkout date
+        const jobId = `ical_${prop.id}_${k}`;
+        const existingJob = await db.ref(`jobs/${jobId}`).once("value");
+        if (!existingJob.val()) {
+          // Find next stay for checkin date
+          const sorted = events.slice().sort((a,b)=>a.start.localeCompare(b.start));
+          const idx = sorted.findIndex(e=>e.uid===ev.uid);
+          const nextCheckin = sorted[idx+1]?.start || null;
+          const wStart = parseWindowTime(ev.end,       prop.checkoutTime||"11:00 AM");
+          const wEnd   = parseWindowTime(nextCheckin,  prop.checkinTime ||"3:00 PM");
+          await db.ref(`jobs/${jobId}`).set({id:jobId,propertyId:prop.id,checkoutDate:ev.end,checkinDate:nextCheckin,status:"pending",cleaner:null,arrivedAt:null,completedAt:null,photos:0,windowStart:wStart||null,windowEnd:wEnd||null,overdueAlertSent:false});
+          added++;
+        }
+      }
+      await db.ref(`properties/${prop.id}`).update({lastSynced:new Date().toISOString()});
+      setSyncRes(v=>({...v,[prop.id]:{ok:true,msg:`✓ Synced — ${added} new job${added!==1?"s":""} added (${events.length} bookings total)`}}));
+    } catch(e) {
+      setSyncRes(v=>({...v,[prop.id]:{ok:false,msg:`✗ ${e.message}`}}));
+    }
+    setSyncing(v=>({...v,[prop.id]:false}));
+  };
+
+  const deleteProp = async id => {
+    if (!confirm("Delete this property and all its data?")) return;
+    await db.ref(`properties/${id}`).remove();
+    await db.ref(`stays/${id}`).remove();
+    const jobsSnap = await db.ref("jobs").orderByChild("propertyId").equalTo(id).once("value");
+    const jobKeys = Object.keys(jobsSnap.val()||{});
+    await Promise.all(jobKeys.map(k=>db.ref(`jobs/${k}`).remove()));
+    await db.ref(`inventory/${id}`).remove();
+  };
+
+  const cleaners = accounts.filter(a=>a.authorized&&(a.role==="cleaner"||a.role==="manager"||a.role==="owner")).map(a=>a.name);
+
+  return <div>
+    {!readOnly&&<AddPropertyModal open={addOpen} onClose={()=>setAddOpen(false)} properties={properties} onSync={doSync}/>}
+    {editProp&&<EditPropertyModal prop={editProp} onClose={()=>setEditProp(null)}/>}
+
+    {!readOnly&&<div style={{marginBottom:24}}>
+      <Btn onClick={()=>setAddOpen(true)}>➕ Add Property</Btn>
+    </div>}
+
+    {properties.length===0?<Card style={{textAlign:"center",padding:40}}>
+      <div style={{fontSize:36,marginBottom:12}}>🏠</div>
+      <div style={{fontWeight:700,fontSize:16,color:COLORS.navy,marginBottom:6}}>No properties yet</div>
+      <div style={{fontSize:13,color:COLORS.slate}}>{readOnly?"No properties have been added yet. Ask an owner to sync the Airbnb calendar.":"Click \"Add Property\" above to paste your Airbnb iCal link."}</div>
+    </Card>:properties.map(prop=>{
+      const propStays = staysByProp(prop.id);
+      const upcoming  = propStays.filter(s=>stayStatus(s)!=="past");
+      const past      = propStays.filter(s=>stayStatus(s)==="past").slice(-3); // last 3
+
+      return <div key={prop.id} style={{marginBottom:32}}>
+        {/* Property header */}
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14,flexWrap:"wrap"}}>
+          <div style={{width:14,height:14,borderRadius:"50%",background:prop.color,flexShrink:0}}/>
+          <h3 style={{fontSize:16,fontWeight:800,color:COLORS.navy,fontFamily:DISPLAY,margin:0}}>{prop.name}</h3>
+          {prop.address&&<span style={{fontSize:12,color:COLORS.slate}}>{prop.address}</span>}
+          {prop.lastSynced&&<span style={{fontSize:11,color:COLORS.slate}}>· Synced {new Date(prop.lastSynced).toLocaleString()}</span>}
+          <div style={{flex:1}}/>
+          {!readOnly&&<>
+            <Btn small variant="outline" disabled={syncing[prop.id]} onClick={()=>doSync(prop,null)}>
+              {syncing[prop.id]?"⏳":"🔄"} {syncing[prop.id]?"Syncing…":"Re-sync"}
+            </Btn>
+            <Btn small variant="ghost" onClick={()=>setEditProp(prop)}>✏️ Edit</Btn>
+            <Btn small variant="red" onClick={()=>deleteProp(prop.id)}>🗑</Btn>
+          </>}
+        </div>
+        {syncRes[prop.id]&&<div style={{marginBottom:12}}>
+          <div style={{fontSize:12,fontWeight:600,color:syncRes[prop.id].ok?COLORS.green:COLORS.red,marginBottom:syncRes[prop.id].ok?0:8}}>{syncRes[prop.id].msg}</div>
+          {!syncRes[prop.id].ok&&<div>
+            <div style={{fontSize:11,color:COLORS.slate,marginBottom:4}}>Paste the iCal content manually to sync:</div>
+            <textarea value={pasteText[prop.id]||""} onChange={e=>setPasteText(v=>({...v,[prop.id]:e.target.value}))}
+              placeholder="Open your Airbnb calendar link in a browser, copy all the text, and paste it here…"
+              style={{width:"100%",height:80,padding:"8px 10px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:"monospace",fontSize:11,resize:"vertical",boxSizing:"border-box",display:"block",marginBottom:6}}/>
+            <Btn small onClick={()=>{ if(pasteText[prop.id]?.trim()) doSync(prop, pasteText[prop.id].trim()); }}
+              disabled={!pasteText[prop.id]?.trim()}>Sync from Paste</Btn>
+          </div>}
+        </div>}
+
+        {/* Upcoming stays */}
+        {upcoming.length>0&&<>
+          <div style={{fontSize:12,fontWeight:700,color:COLORS.slate,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Upcoming & Active</div>
+          {upcoming.map(s=><StayCard key={s.uid} stay={s} prop={prop} job={jobForStay(s)} readOnly={readOnly} currentUser={currentUser}/>)}
+        </>}
+
+        {/* Past stays */}
+        {past.length>0&&<>
+          <div style={{fontSize:12,fontWeight:700,color:COLORS.slate,textTransform:"uppercase",letterSpacing:1,marginBottom:8,marginTop:14}}>Recent Past (last 3)</div>
+          {past.map(s=><StayCard key={s.uid} stay={s} prop={prop} job={jobForStay(s)} readOnly={readOnly} currentUser={currentUser}/>)}
+        </>}
+
+        {propStays.length===0&&<div style={{fontSize:13,color:COLORS.slate,padding:"14px 0"}}>No bookings synced yet. {!readOnly?"Click Re-sync above.":""}</div>}
+      </div>;
+    })}
+  </div>;
+}
+
+function StayCard({stay,prop,job,readOnly,currentUser}) {
+  const db = useContext(DbCtx);
+  const st = stayStatus(stay);
+  const sc = statusColor(st);
+  const [expanded,setExpanded] = useState(st==="active"||st==="upcoming");
+  const [photos,   setPhotos]  = useState([]);
+  const [lightbox, setLightbox]= useState(null);
+
+  useEffect(() => {
+    if (!expanded || !job || !db) return;
+    const ref = db.ref(`jobPhotos/${job.id}`);
+    ref.on("value", s => setPhotos(objArr(s.val())));
+    return () => ref.off();
+  }, [expanded, job?.id]);
+
+  const uploadPhoto = async (e, type) => {
+    const file = e.target.files[0];
+    if (!file || !job) return;
+    const dataUrl = await compressImage(file);
+    const id = String(Date.now());
+    await db.ref(`jobPhotos/${job.id}/${id}`).set({id, jobId:job.id, type, dataUrl, uploadedBy:currentUser.name, uploadedAt:new Date().toISOString()});
+    e.target.value = "";
+  };
+  const removePhoto = async id => { await db.ref(`jobPhotos/${job.id}/${id}`).remove(); };
+
+  const assignCleaner = async cleaner => {
+    if (!job) return;
+    await db.ref(`jobs/${job.id}`).update({cleaner: cleaner||null});
+  };
+  const updateJobStatus = async newStatus => {
+    if (!job) return;
+    const now = new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+    if (newStatus==="in-progress") await db.ref(`jobs/${job.id}`).update({status:"in-progress",arrivedAt:now});
+    if (newStatus==="complete")    await db.ref(`jobs/${job.id}`).update({status:"complete",completedAt:now});
+  };
+
+  return <div style={{marginBottom:10,borderRadius:14,border:`1px solid ${COLORS.border}`,overflow:"hidden"}}>
+    {/* Stay header */}
+    <div onClick={()=>setExpanded(v=>!v)} style={{padding:"14px 18px",background:COLORS.white,cursor:"pointer",display:"flex",alignItems:"center",gap:12}}>
+      <div style={{flex:1}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+          <span style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{fmtDate(stay.start)} → {fmtDate(stay.end)}</span>
+          <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"2px 9px",borderRadius:20,fontSize:11,fontWeight:700,background:sc.bg,color:sc.color}}>
+            {sc.dot&&<span style={{width:6,height:6,borderRadius:"50%",background:sc.dot,display:"inline-block"}}/>}
+            {st.charAt(0).toUpperCase()+st.slice(1)}
+          </span>
+          <span style={{fontSize:12,color:COLORS.slate,fontWeight:600}}>{stay.nights} night{stay.nights!==1?"s":""}</span>
+        </div>
+        <div style={{fontSize:12,color:COLORS.slate}}>
+          Check-in: {fmtDate(stay.start)} at {prop.checkinTime||"3:00 PM"} · Checkout: {fmtDate(stay.end)} at {prop.checkoutTime||"11:00 AM"}
+        </div>
+      </div>
+      <span style={{color:COLORS.slate,fontSize:16,transition:"transform .2s",transform:expanded?"rotate(90deg)":"none"}}>›</span>
+    </div>
+
+    {expanded&&<div style={{padding:"0 18px 16px",background:COLORS.surface,borderTop:`1px solid ${COLORS.border}`}}>
+      {/* Full stay details */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:14,marginBottom:14}}>
+        <div style={{background:COLORS.white,borderRadius:10,padding:"10px 14px"}}>
+          <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>Check-in</div>
+          <div style={{fontSize:13,fontWeight:700,color:COLORS.navy}}>{fmtDateLong(stay.start)}</div>
+          <div style={{fontSize:12,color:COLORS.blue,marginTop:2}}>at {prop.checkinTime||"3:00 PM"}</div>
+        </div>
+        <div style={{background:COLORS.white,borderRadius:10,padding:"10px 14px"}}>
+          <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>Checkout</div>
+          <div style={{fontSize:13,fontWeight:700,color:COLORS.navy}}>{fmtDateLong(stay.end)}</div>
+          <div style={{fontSize:12,color:COLORS.blue,marginTop:2}}>at {prop.checkoutTime||"11:00 AM"}</div>
+        </div>
+      </div>
+
+      {/* Cleaning job */}
+      {job&&<div style={{background:COLORS.white,borderRadius:10,padding:"12px 14px",border:`1px solid ${COLORS.border}`}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+          <span style={{fontSize:16}}>🧹</span>
+          <div style={{flex:1}}>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontWeight:700,fontSize:13,color:COLORS.navy}}>Cleaning on {fmtDate(stay.end)}</span>
+              <Badge config={jobStatusCfg[job.status]} small/>
+            </div>
+            <div style={{fontSize:12,color:COLORS.slate,marginTop:2}}>
+              {job.cleaner?`👤 ${job.cleaner}`:"Unassigned — waiting for a cleaner to claim"}
+              {job.arrivedAt?` · Arrived ${job.arrivedAt}`:""}
+              {job.completedAt?` · Done ${job.completedAt}`:""}
+            </div>
+          </div>
+        </div>
+        {/* Owner: status actions only — cleaners self-assign */}
+        {!readOnly&&<>
+          {job.status==="pending"&&<Btn variant="amber" small onClick={()=>updateJobStatus("in-progress")} style={{width:"100%",justifyContent:"center"}}>🕐 Mark In Progress</Btn>}
+          {job.status==="in-progress"&&<Btn variant="green" small onClick={()=>updateJobStatus("complete")} style={{width:"100%",justifyContent:"center"}}>✓ Mark Complete</Btn>}
+        </>}
+        {/* Cleaner: claim / release / start / complete */}
+        {readOnly&&<>
+          {!job.cleaner&&job.status!=="complete"&&
+            <Btn variant="primary" small onClick={()=>assignCleaner(currentUser.name)} style={{width:"100%",justifyContent:"center"}}>✋ Claim this job</Btn>}
+          {job.cleaner===currentUser?.name&&<div style={{display:"flex",flexDirection:"column",gap:6}}>
+            <Btn variant="ghost" small onClick={()=>assignCleaner(null)} style={{width:"100%",justifyContent:"center"}}>↩ Release job</Btn>
+            {job.status==="pending"&&<Btn variant="amber" small onClick={()=>updateJobStatus("in-progress")} style={{width:"100%",justifyContent:"center"}}>🕐 Start Cleaning</Btn>}
+            {job.status==="in-progress"&&<Btn variant="green" small onClick={()=>updateJobStatus("complete")} style={{width:"100%",justifyContent:"center"}}>✓ Mark Complete</Btn>}
+          </div>}
+          {job.cleaner&&job.cleaner!==currentUser?.name&&
+            <div style={{fontSize:12,color:COLORS.slate,textAlign:"center",padding:"4px 0",fontStyle:"italic"}}>Claimed by {job.cleaner}</div>}
+        </>}
+      </div>}
+      {!job&&<div style={{fontSize:12,color:COLORS.slate,marginTop:4}}>No cleaning job created for this checkout yet. Re-sync the iCal to generate one.</div>}
+
+      {/* Before / After Photos */}
+      {job&&<div style={{marginTop:14,borderTop:`1px solid ${COLORS.border}`,paddingTop:14}}>
+        <div style={{fontSize:12,fontWeight:700,color:COLORS.slate,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>
+          Cleaning Photos {photos.length>0?`· ${photos.length} total`:""}
+        </div>
+        {["before","after"].map(type=>{
+          const typePhotos = photos.filter(p=>p.type===type);
+          const canUpload  = readOnly && job.cleaner===currentUser?.name;
+          return <div key={type} style={{marginBottom:14}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:7}}>
+              <span style={{fontSize:11,fontWeight:700,color:type==="before"?COLORS.amber:COLORS.green,textTransform:"uppercase",letterSpacing:.8}}>
+                {type==="before"?"📸 Before":"✅ After"} ({typePhotos.length})
+              </span>
+              {canUpload&&<label style={{cursor:"pointer",display:"inline-flex",alignItems:"center",gap:5,padding:"4px 12px",borderRadius:20,background:COLORS.sky,color:COLORS.blue,fontSize:11,fontWeight:600,border:`1.5px solid ${COLORS.border}`}}>
+                + Add Photo
+                <input type="file" accept="image/*" onChange={e=>uploadPhoto(e,type)} style={{display:"none"}}/>
+              </label>}
+            </div>
+            {typePhotos.length>0
+              ?<div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                {typePhotos.map(p=>(
+                  <div key={p.id} style={{position:"relative"}}>
+                    <img src={p.dataUrl} onClick={()=>setLightbox(p)}
+                      style={{width:84,height:84,objectFit:"cover",borderRadius:10,cursor:"zoom-in",border:`2px solid ${type==="before"?"#FEF3C7":"#D1FAE5"}`}}/>
+                    {(readOnly?p.uploadedBy===currentUser?.name:true)&&
+                      <button onClick={()=>removePhoto(p.id)}
+                        style={{position:"absolute",top:-6,right:-6,width:20,height:20,borderRadius:"50%",background:COLORS.red,color:"#fff",border:"2px solid #fff",cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1,padding:0}}>×</button>}
+                    <div style={{fontSize:9,color:COLORS.slate,textAlign:"center",marginTop:3,maxWidth:84,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.uploadedBy}</div>
+                  </div>
+                ))}
+              </div>
+              :<div style={{fontSize:12,color:COLORS.slate,fontStyle:"italic"}}>
+                {canUpload?`Tap "+ Add Photo" to add ${type} photos.`:`No ${type} photos yet.`}
+              </div>}
+          </div>;
+        })}
+      </div>}
+
+      {lightbox&&<div onClick={()=>setLightbox(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.93)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center",cursor:"zoom-out"}}>
+        <img src={lightbox.dataUrl} style={{maxWidth:"95vw",maxHeight:"88vh",objectFit:"contain",borderRadius:10}}/>
+        <button onClick={()=>setLightbox(null)} style={{position:"absolute",top:16,right:20,background:"none",border:"none",color:"#fff",fontSize:32,cursor:"pointer",lineHeight:1}}>×</button>
+        <div style={{position:"absolute",bottom:20,left:0,right:0,textAlign:"center",color:"rgba(255,255,255,0.75)",fontSize:12}}>
+          {lightbox.type.charAt(0).toUpperCase()+lightbox.type.slice(1)} photo · by {lightbox.uploadedBy} · {new Date(lightbox.uploadedAt).toLocaleString()}
+        </div>
+      </div>}
+    </div>}
+  </div>;
+}
+
+function AddPropertyModal({open,onClose,properties,onSync}) {
+  const db = useContext(DbCtx);
+  const [name,setName]=useState(""); const [url,setUrl]=useState(""); const [raw,setRaw]=useState("");
+  const [showPaste,setShowPaste]=useState(false); const [err,setErr]=useState(""); const [loading,setLoading]=useState(false);
+  const [checkinTime,setCheckinTime]=useState("3:00 PM"); const [checkoutTime,setCheckoutTime]=useState("11:00 AM");
+
+  if (!open) return null;
+  const submit = async () => {
+    if (!name.trim()){setErr("Enter a property name.");return;}
+    if (!url.trim()&&!raw.trim()){setErr("Enter an iCal URL or paste iCal content.");return;}
+    setLoading(true); setErr("");
+    const prop = {id:String(Date.now()),name:name.trim(),icalUrl:url.trim(),color:PROP_COLORS[properties.length%PROP_COLORS.length],address:"",checkinTime,checkoutTime,lastSynced:null};
+    await db.ref(`properties/${prop.id}`).set(prop);
+    onClose();
+    await onSync(prop, raw.trim()||null);
+    setName(""); setUrl(""); setRaw(""); setShowPaste(false);
+    setLoading(false);
+  };
+  return <Modal onClose={onClose}>
+    <h3 style={{fontFamily:DISPLAY,fontSize:20,color:COLORS.navy,marginBottom:20}}>Add Property</h3>
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      <FieldInput label="Property Name" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. City Apartment"/>
+      <FieldInput label="Airbnb iCal URL" value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://www.airbnb.com/calendar/ical/..."/>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Check-in Time</label>
+          <select value={checkinTime} onChange={e=>setCheckinTime(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+            {CHECK_TIMES.map(t=><option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Checkout Time</label>
+          <select value={checkoutTime} onChange={e=>setCheckoutTime(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+            {CHECK_TIMES.map(t=><option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+      </div>
+      <div>
+        <span onClick={()=>setShowPaste(v=>!v)} style={{fontSize:12,color:COLORS.blue,cursor:"pointer",fontWeight:600}}>{showPaste?"▲ Hide":"▼ Paste iCal content instead"}</span>
+        {showPaste&&<textarea value={raw} onChange={e=>setRaw(e.target.value)} placeholder="Paste raw iCal text here…" style={{display:"block",marginTop:8,width:"100%",height:100,padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:"monospace",fontSize:11,resize:"vertical",boxSizing:"border-box"}}/>}
+      </div>
+    </div>
+    <ErrBox msg={err}/>
+    <div style={{display:"flex",gap:10,marginTop:20}}>
+      <Btn onClick={submit} disabled={loading}>{loading?"⏳ Adding…":"Add & Sync"}</Btn>
+      <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+    </div>
+  </Modal>;
+}
+
+function EditPropertyModal({prop,onClose}) {
+  const db = useContext(DbCtx);
+  const [name,setName]=useState(prop.name); const [url,setUrl]=useState(prop.icalUrl||"");
+  const [addr,setAddr]=useState(prop.address||""); const [checkinTime,setCheckinTime]=useState(prop.checkinTime||"3:00 PM"); const [checkoutTime,setCheckoutTime]=useState(prop.checkoutTime||"11:00 AM");
+  const save = async () => {
+    await db.ref(`properties/${prop.id}`).update({name:name.trim(),icalUrl:url.trim(),address:addr.trim(),checkinTime,checkoutTime});
+    onClose();
+  };
+  return <Modal onClose={onClose}>
+    <h3 style={{fontFamily:DISPLAY,fontSize:20,color:COLORS.navy,marginBottom:20}}>Edit Property</h3>
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      <FieldInput label="Name" value={name} onChange={e=>setName(e.target.value)}/>
+      <FieldInput label="iCal URL" value={url} onChange={e=>setUrl(e.target.value)}/>
+      <FieldInput label="Address (optional)" value={addr} onChange={e=>setAddr(e.target.value)}/>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Check-in Time</label>
+          <select value={checkinTime} onChange={e=>setCheckinTime(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+            {CHECK_TIMES.map(t=><option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Checkout Time</label>
+          <select value={checkoutTime} onChange={e=>setCheckoutTime(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+            {CHECK_TIMES.map(t=><option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+      </div>
+    </div>
+    <div style={{display:"flex",gap:10,marginTop:20}}>
+      <Btn onClick={save}>Save</Btn>
+      <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+    </div>
+  </Modal>;
+}
+
+// ─── DASHBOARD VIEW ───────────────────────────────────────────────────────────
+// ─── TURNOVER TIMER ───────────────────────────────────────────────────────────
+function TurnoverTimer({job, prop, large=false}) {
+  const db = useContext(DbCtx);
+  const [now, setNow] = useState(()=>Date.now());
+  const alertFiredRef = useRef(false);
+
+  const windowStart = parseWindowTime(job?.checkoutDate, prop?.checkoutTime||"11:00 AM");
+  const windowEnd   = parseWindowTime(job?.checkinDate,  prop?.checkinTime ||"3:00 PM");
+
+  useEffect(()=>{
+    const id = setInterval(()=>setNow(Date.now()),1000);
+    return ()=>clearInterval(id);
+  },[]);
+
+  // Write overdueAlertSent flag once when window expires and job still not complete
+  useEffect(()=>{
+    if (!db||!job||!windowEnd||job.status==="complete"||job.overdueAlertSent||alertFiredRef.current) return;
+    if (now>windowEnd) { alertFiredRef.current=true; db.ref(`jobs/${job.id}/overdueAlertSent`).set(true); }
+  },[now]);
+
+  if (!job?.checkoutDate||!job?.checkinDate||!windowStart||!windowEnd) return null;
+
+  const totalWindow = windowEnd-windowStart;
+  const remaining   = windowEnd-now;
+
+  // Completed — show time to spare
+  if (job.status==="complete"&&job.completedAt) {
+    const spare = windowEnd - new Date(job.completedAt).getTime();
+    return <div style={{fontSize:large?14:11,fontWeight:700,color:"#059669",background:"#D1FAE5",padding:"4px 10px",borderRadius:20,display:"inline-flex",alignItems:"center",gap:4}}>
+      ✅ Done · {spare>0?`${fmtWindowDuration(spare)}to spare`:"On time"}
+    </div>;
+  }
+
+  // Not started yet — show when window opens
+  if (now<windowStart) {
+    const untilStart = windowStart-now;
+    return <div style={{fontSize:large?13:11,color:COLORS.slate,lineHeight:1.5}}>
+      <div style={{fontWeight:600,color:COLORS.navy}}>
+        Checkout {prop.checkoutTime||"11:00 AM"} · {fmtWindowDuration(totalWindow)}window
+      </div>
+      <div>Starts in {fmtWindowDuration(untilStart)}</div>
+    </div>;
+  }
+
+  // Overdue
+  if (remaining<=0) {
+    return <div className={large?"timer-flash":""} style={{fontSize:large?28:14,fontWeight:800,color:"#DC2626",display:"flex",alignItems:"center",gap:6}}>
+      {large&&<span style={{fontSize:20}}>🔴</span>}
+      <span>OVERDUE{large?" — Guest arriving soon!":""}</span>
+    </div>;
+  }
+
+  // Live countdown
+  const h=Math.floor(remaining/3600000), m=Math.floor((remaining%3600000)/60000), s=Math.floor((remaining%60000)/1000);
+  const color = remaining>7200000?COLORS.green:remaining>3600000?COLORS.amber:"#DC2626";
+  const isUrgent = remaining<=3600000;
+  const pct = Math.max(0,Math.min(100,(remaining/totalWindow)*100));
+
+  return <div style={{display:"inline-block"}}>
+    <div className={isUrgent&&large?"timer-flash":""} style={{fontFamily:"monospace",fontSize:large?36:15,fontWeight:800,color,letterSpacing:large?2:1}}>
+      {pad2(h)}:{pad2(m)}:{pad2(s)}
+    </div>
+    {large&&<div style={{marginTop:6,height:4,borderRadius:2,background:"#E2E8F0",overflow:"hidden"}}>
+      <div style={{height:"100%",borderRadius:2,background:color,width:`${pct}%`,transition:"width 1s linear"}}/>
+    </div>}
+    {large&&<div style={{fontSize:11,color:COLORS.slate,marginTop:4}}>
+      {isUrgent?"⚠️ Under 1 hour — wrap up soon!":remaining>7200000?"🟢 On track":"🟡 Getting tight"}
+    </div>}
+  </div>;
+}
+
+function DashboardView({jobs,inventory,properties,currentUser,stays,maintenance}) {
+  const complete=jobs.filter(j=>j.status==="complete").length;
+  const inProgress=jobs.filter(j=>j.status==="in-progress").length;
+  const pending=jobs.filter(j=>j.status==="pending").length;
+  const needsRestock=inventory.filter(i=>i.status==="pending").length;
+  const todayStr = today();
+  const activeStays=stays.filter(s=>s.start<=todayStr&&s.end>todayStr);
+
+  return <div>
+    <div style={{background:`linear-gradient(135deg,${COLORS.navy} 0%,#1B3A6B 100%)`,borderRadius:20,padding:"28px 32px",marginBottom:24,display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:20}}>
+      <div>
+        <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,marginBottom:4}}>{new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"})}</div>
+        <div style={{color:"#fff",fontSize:22,fontWeight:700,fontFamily:DISPLAY}}>Good morning, {currentUser.name} 👋</div>
+        <div style={{color:"rgba(255,255,255,0.7)",fontSize:13,marginTop:4}}>
+          {activeStays.length>0?`${activeStays.length} active stay${activeStays.length>1?"s":""} right now`:inProgress>0?`${inProgress} clean${inProgress>1?"s":""} in progress`:"No active cleans at the moment"}
+        </div>
+      </div>
+      <div style={{display:"flex",gap:28}}>
+        {[["Total Jobs",jobs.length,"#fff"],["Complete",complete,COLORS.green],["In Progress",inProgress,"#60A5FA"],["Pending",pending,COLORS.amber]].map(([l,v,c])=>(
+          <div key={l} style={{textAlign:"center"}}>
+            <div style={{fontSize:28,fontWeight:700,color:c,fontFamily:DISPLAY}}>{v}</div>
+            <div style={{fontSize:12,color:"rgba(255,255,255,0.6)",marginTop:2}}>{l}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+
+    {properties.length===0?<Card style={{textAlign:"center",padding:40,marginBottom:24}}>
+      <div style={{fontSize:36,marginBottom:12}}>🏠</div>
+      <div style={{fontWeight:700,fontSize:16,color:COLORS.navy,marginBottom:6}}>No properties yet</div>
+      <div style={{fontSize:13,color:COLORS.slate}}>Go to <strong>Calendar</strong> to add your first property and sync your Airbnb iCal.</div>
+    </Card>:<div style={{marginBottom:24}}>
+      <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,marginBottom:14,fontFamily:DISPLAY}}>Properties</h3>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:14}}>
+        {properties.map(p=>{
+          const pJobs=jobs.filter(j=>j.propertyId===p.id);
+          const active=pJobs.find(j=>j.status==="in-progress");
+          const next=pJobs.filter(j=>j.status==="pending").sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate))[0];
+          const guestIn=activeStays.find(s=>s.propId===p.id);
+          return <Card key={p.id}>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+              <div style={{width:10,height:10,borderRadius:"50%",background:p.color,flexShrink:0}}/>
+              <div style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{p.name}</div>
+            </div>
+            {p.address&&<div style={{fontSize:11,color:COLORS.slate,marginBottom:10}}>{p.address}</div>}
+            {guestIn?<div style={{fontSize:12,color:"#065F46",fontWeight:600,background:"#D1FAE5",padding:"4px 10px",borderRadius:20,display:"inline-block",marginBottom:8}}>🏠 Guest staying in</div>
+            :active?<div style={{marginBottom:8}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                <Badge config={jobStatusCfg["in-progress"]} small/>
+                {active.cleaner&&<span style={{fontSize:11,color:COLORS.slate}}>{active.cleaner}</span>}
+              </div>
+              <TurnoverTimer job={active} prop={p}/>
+            </div>
+            :next?<div style={{marginBottom:8}}>
+              <div style={{fontSize:11,color:COLORS.slate,marginBottom:3}}>Next clean</div>
+              <TurnoverTimer job={next} prop={p}/>
+              {!next.checkinDate&&<div style={{fontSize:11,color:COLORS.slate,marginTop:2}}>Checkout: <strong>{fmtDate(next.checkoutDate)}</strong></div>}
+            </div>
+            :<div style={{fontSize:12,color:COLORS.slate,marginBottom:8}}>No upcoming jobs</div>}
+            {(()=>{const mo=(maintenance||[]).filter(t=>t.propertyId===p.id&&t.status!=="resolved");const urg=mo.some(t=>t.urgency==="urgent");return mo.length>0?<div style={{fontSize:11,fontWeight:700,color:urg?"#991B1B":COLORS.amber,background:urg?"#FEE2E2":"#FEF3C7",padding:"3px 8px",borderRadius:20,display:"inline-block"}}>{urg?"🚨":""} {mo.length} maintenance open</div>:null;})()}
+          </Card>;
+        })}
+      </div>
+    </div>}
+
+    {needsRestock>0&&<Card style={{background:"#FFF7ED",border:"1px solid #FED7AA",marginBottom:20}}>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <span style={{fontSize:20}}>📦</span>
+        <div>
+          <div style={{fontWeight:700,color:"#9A3412",fontSize:14}}>{needsRestock} item{needsRestock>1?"s":""} need restocking</div>
+          <div style={{fontSize:12,color:"#C2410C"}}>Check the Inventory tab to review and order</div>
+        </div>
+      </div>
+    </Card>}
+
+    {jobs.length>0&&<>
+      <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,marginBottom:14,fontFamily:DISPLAY}}>Recent Jobs</h3>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {jobs.slice().sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate)).slice(0,6).map(job=>{
+          const prop=getProp(job.propertyId,properties);
+          return <Card key={job.id} style={{padding:"14px 18px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:12}}>
+              <div style={{width:8,height:40,borderRadius:4,background:prop.color,flexShrink:0}}/>
+              <div style={{flex:1}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+                  <span style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{prop.name}</span>
+                  <Badge config={jobStatusCfg[job.status]} small/>
+                  {!job.cleaner&&<span style={{fontSize:11,color:COLORS.amber,fontWeight:600}}>Unassigned</span>}
+                </div>
+                <div style={{fontSize:12,color:COLORS.slate}}>
+                  Checkout: {fmtDate(job.checkoutDate)}{job.checkinDate?` → Check-in: ${fmtDate(job.checkinDate)}`:""} {job.cleaner?`· ${job.cleaner}`:""}
+                </div>
+              </div>
+            </div>
+          </Card>;
+        })}
+      </div>
+    </>}
+  </div>;
+}
+
+// ─── INVENTORY VIEW ───────────────────────────────────────────────────────────
+function InventoryView({inventory,properties,currentUser}) {
+  const db = useContext(DbCtx);
+  const isOwner = currentUser.role!=="cleaner";
+  const [selProp,setSelProp]=useState(null);
+  const [showFlag,setShowFlag]=useState(false);
+  const [newItem,setNewItem]=useState(""); const [customItem,setCustomItem]=useState("");
+
+  const activeProp = selProp || properties[0]?.id || null;
+  const propInv = inventory.filter(i=>i.propertyId===activeProp);
+  const pending  = propInv.filter(i=>i.status==="pending");
+  const ordered  = propInv.filter(i=>i.status==="ordered");
+  const restocked= propInv.filter(i=>i.status==="restocked");
+
+  const updateStatus = async (item,status) => {
+    await db.ref(`inventory/${item.propertyId}/${item.id}`).update({status, ...(status==="ordered"?{orderedAt:new Date().toISOString()}:{}), ...(status==="restocked"?{restockedAt:new Date().toISOString()}:{})});
+  };
+  const removeItem = async item => {
+    await db.ref(`inventory/${item.propertyId}/${item.id}`).remove();
+  };
+  const addFlag = async () => {
+    const item = newItem==="custom"?customItem:newItem;
+    if (!activeProp||!item) return;
+    const id = String(Date.now());
+    await db.ref(`inventory/${activeProp}/${id}`).set({id,propertyId:activeProp,item,status:"pending",flaggedAt:new Date().toISOString(),flaggedBy:currentUser.name});
+    setNewItem(""); setCustomItem(""); setShowFlag(false);
+  };
+
+  if (properties.length===0) return <Card style={{textAlign:"center",padding:40}}>
+    <div style={{fontSize:36,marginBottom:12}}>📦</div>
+    <div style={{fontWeight:700,fontSize:16,color:COLORS.navy,marginBottom:6}}>No properties yet</div>
+    <div style={{fontSize:13,color:COLORS.slate}}>Add a property in the Calendar tab first.</div>
+  </Card>;
+
+  const InvItem = ({item})=>(
+    <Card style={{padding:"14px 18px",marginBottom:8}}>
+      <div style={{display:"flex",alignItems:"center",gap:12}}>
+        <span style={{fontSize:22}}>📦</span>
+        <div style={{flex:1}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+            <span style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{item.item}</span>
+            <Badge config={invStatusCfg[item.status]} small/>
+          </div>
+          <div style={{fontSize:11,color:COLORS.slate}}>
+            Flagged by {item.flaggedBy} · {new Date(item.flaggedAt).toLocaleString()}
+            {item.orderedAt&&` · Ordered ${new Date(item.orderedAt).toLocaleDateString()}`}
+            {item.restockedAt&&` · Restocked ${new Date(item.restockedAt).toLocaleDateString()}`}
+          </div>
+        </div>
+        {isOwner&&<div style={{display:"flex",gap:6}}>
+          {item.status==="pending"   &&<Btn small variant="amber" onClick={()=>updateStatus(item,"ordered")}>Mark Ordered</Btn>}
+          {item.status==="ordered"   &&<Btn small variant="green" onClick={()=>updateStatus(item,"restocked")}>Restocked</Btn>}
+          {item.status==="restocked" &&<span style={{fontSize:12,color:COLORS.green,fontWeight:600}}>✓ Done</span>}
+          <Btn small variant="ghost" onClick={()=>removeItem(item)}>✕</Btn>
+        </div>}
+      </div>
+    </Card>
+  );
+
+  return <div>
+    {/* Property tabs */}
+    <div style={{display:"flex",gap:6,marginBottom:20,overflowX:"auto",paddingBottom:4}}>
+      {properties.map(p=>(
+        <button key={p.id} onClick={()=>setSelProp(p.id)} style={{padding:"8px 16px",borderRadius:20,border:"none",cursor:"pointer",fontFamily:FONT,fontWeight:600,fontSize:12,whiteSpace:"nowrap",background:activeProp===p.id?p.color:COLORS.sky,color:activeProp===p.id?"#fff":COLORS.slate,display:"flex",alignItems:"center",gap:6}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:activeProp===p.id?"rgba(255,255,255,0.7)":p.color,display:"inline-block"}}/>
+          {p.name}
+          {inventory.filter(i=>i.propertyId===p.id&&i.status==="pending").length>0&&
+            <span style={{background:"#EF4444",color:"#fff",fontSize:10,fontWeight:700,padding:"1px 6px",borderRadius:20}}>
+              {inventory.filter(i=>i.propertyId===p.id&&i.status==="pending").length}
+            </span>}
+        </button>
+      ))}
+    </div>
+
+    {/* Summary stats */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:20}}>
+      {[[pending.length,"Needs Order",COLORS.red,"#FEE2E2"],[ordered.length,"Ordered",COLORS.amber,"#FEF3C7"],[restocked.length,"Restocked",COLORS.green,"#D1FAE5"]].map(([v,l,c,bg])=>(
+        <div key={l} style={{background:bg,borderRadius:14,padding:"14px 18px",textAlign:"center"}}>
+          <div style={{fontSize:24,fontWeight:700,color:c,fontFamily:DISPLAY}}>{v}</div>
+          <div style={{fontSize:12,color:COLORS.slate,marginTop:2}}>{l}</div>
+        </div>
+      ))}
+    </div>
+
+    <div style={{display:"flex",justifyContent:"flex-end",marginBottom:16}}>
+      <Btn small onClick={()=>setShowFlag(true)}>+ Flag Item</Btn>
+    </div>
+
+    {pending.length===0&&ordered.length===0&&restocked.length===0
+      ?<div style={{textAlign:"center",padding:"32px 0",color:COLORS.slate,fontSize:14}}>No inventory items for this property 🎉</div>
+      :<>
+        {pending.length>0&&<><div style={{fontSize:12,fontWeight:700,color:COLORS.red,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Needs Order</div>{pending.map(i=><InvItem key={i.id} item={i}/>)}</>}
+        {ordered.length>0&&<><div style={{fontSize:12,fontWeight:700,color:COLORS.amber,textTransform:"uppercase",letterSpacing:1,marginBottom:8,marginTop:14}}>Ordered</div>{ordered.map(i=><InvItem key={i.id} item={i}/>)}</>}
+        {restocked.length>0&&<><div style={{fontSize:12,fontWeight:700,color:COLORS.green,textTransform:"uppercase",letterSpacing:1,marginBottom:8,marginTop:14}}>Restocked</div>{restocked.map(i=><InvItem key={i.id} item={i}/>)}</>}
+      </>}
+
+    {showFlag&&<Modal onClose={()=>setShowFlag(false)}>
+      <h3 style={{fontFamily:DISPLAY,fontSize:20,color:COLORS.navy,marginBottom:20}}>Flag Low Inventory</h3>
+      <p style={{fontSize:13,color:COLORS.slate,marginBottom:16}}>Flagging for: <strong>{getProp(activeProp,properties).name}</strong></p>
+      <div style={{marginBottom:14}}>
+        <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Item</label>
+        <select value={newItem} onChange={e=>setNewItem(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+          <option value="">Select item…</option>
+          {CHECKLIST.map(i=><option key={i} value={i}>{i}</option>)}
+          <option value="custom">+ Custom item…</option>
+        </select>
+      </div>
+      {newItem==="custom"&&<input placeholder="Enter item name…" value={customItem} onChange={e=>setCustomItem(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13,marginBottom:14,boxSizing:"border-box"}}/>}
+      <div style={{display:"flex",gap:10,marginTop:20}}>
+        <Btn onClick={addFlag} disabled={!newItem||(newItem==="custom"&&!customItem)}>Flag Item</Btn>
+        <Btn variant="ghost" onClick={()=>setShowFlag(false)}>Cancel</Btn>
+      </div>
+    </Modal>}
+  </div>;
+}
+
+// ─── MY JOBS VIEW ────────────────────────────────────────────────────────────
+function MyJobsView({jobs, properties, currentUser}) {
+  const db = useContext(DbCtx);
+  const [selected, setSelected] = useState(null);
+  const [showDone, setShowDone] = useState(false);
+  const todayStr = today();
+
+  const myJobs = jobs
+    .filter(j => j.cleaner === currentUser.name)
+    .sort((a,b) => a.checkoutDate.localeCompare(b.checkoutDate));
+
+  const todayJobs    = myJobs.filter(j => j.checkoutDate === todayStr && j.status !== "complete");
+  const upcomingJobs = myJobs.filter(j => j.checkoutDate > todayStr  && j.status !== "complete");
+  const doneJobs     = myJobs.filter(j => j.status === "complete").slice().reverse().slice(0,10);
+
+  const updateStatus = async (job, status) => {
+    const now = new Date().toISOString();
+    const update = {status, updatedAt:now};
+    if (status==="in-progress") update.arrivedAt = now;
+    if (status==="complete")    update.completedAt = now;
+    await db.ref(`jobs/${job.id}`).update(update);
+  };
+
+  const JobCard = ({job, highlight=false}) => {
+    const prop = properties.find(p=>p.id===job.propertyId) || {name:"Unknown",color:"#94A3B8"};
+    const isToday   = job.checkoutDate === todayStr;
+    const dateLabel = isToday ? "Today" : new Date(...job.checkoutDate.split("-").map((v,i)=>i===1?v-1:Number(v)))
+      .toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
+
+    return <div onClick={()=>setSelected({job,prop})}
+      style={{background:"#fff",borderRadius:16,overflow:"hidden",
+              boxShadow:highlight?"0 4px 20px rgba(27,79,216,0.15)":"0 1px 4px rgba(0,0,0,0.07)",
+              border:highlight?`2px solid ${COLORS.blue}`:`1.5px solid ${COLORS.border}`,
+              marginBottom:12,cursor:"pointer"}}>
+
+      {/* Color bar */}
+      <div style={{height:5,background:prop.color,width:"100%"}}/>
+
+      <div style={{padding:"16px 18px"}}>
+        {/* Property + date */}
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:10,gap:8}}>
+          <div>
+            <div style={{fontWeight:700,fontSize:17,color:COLORS.navy,marginBottom:2}}>{prop.name}</div>
+            {prop.address&&<div style={{fontSize:12,color:COLORS.slate}}>{prop.address}</div>}
+          </div>
+          <div style={{flexShrink:0,textAlign:"right"}}>
+            <div style={{fontSize:isToday?13:12,fontWeight:700,
+                         color:isToday?"#fff":COLORS.slate,
+                         background:isToday?COLORS.blue:"transparent",
+                         padding:isToday?"3px 10px":"0",borderRadius:20}}>
+              {dateLabel}
+            </div>
+            <div style={{fontSize:11,color:COLORS.slate,marginTop:3}}>
+              Checkout {prop.checkoutTime||"11:00 AM"}
+            </div>
+          </div>
+        </div>
+
+        {/* Timer */}
+        {job.checkinDate&&<div style={{marginBottom:12,padding:"10px 14px",background:COLORS.surface,borderRadius:10}}>
+          <div style={{fontSize:10,fontWeight:700,color:COLORS.slate,letterSpacing:1,marginBottom:4}}>CLEANING WINDOW</div>
+          <TurnoverTimer job={job} prop={prop} large/>
+        </div>}
+
+        {/* Status + actions */}
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:job.status!=="complete"?12:0}}>
+          <Badge config={jobStatusCfg[job.status]} small/>
+          {job.status==="in-progress"&&job.arrivedAt&&
+            <span style={{fontSize:11,color:COLORS.slate}}>Started {new Date(job.arrivedAt).toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"})}</span>}
+        </div>
+
+        {job.status==="pending"&&<button
+          onClick={e=>{e.stopPropagation();updateStatus(job,"in-progress");}}
+          style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:"pointer",
+                  background:COLORS.amber,color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,
+                  display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+          🕐 Start Cleaning
+        </button>}
+
+        {job.status==="in-progress"&&<button
+          onClick={e=>{e.stopPropagation();updateStatus(job,"complete");}}
+          style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:"pointer",
+                  background:COLORS.green,color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,
+                  display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+          ✅ Mark Complete
+        </button>}
+
+        {job.status==="complete"&&<div style={{textAlign:"center",fontSize:13,fontWeight:600,color:"#059669",padding:"6px 0"}}>
+          ✅ Completed {job.completedAt?new Date(job.completedAt).toLocaleDateString("en-US",{month:"short",day:"numeric"}):""}
+        </div>}
+      </div>
+    </div>;
+  };
+
+  const Section = ({title, count, children, accent}) => (
+    <div style={{marginBottom:24}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+        <h3 style={{fontFamily:DISPLAY,fontSize:15,fontWeight:700,color:accent||COLORS.navy}}>{title}</h3>
+        {count>0&&<span style={{background:accent||COLORS.blue,color:"#fff",fontSize:11,fontWeight:700,padding:"1px 8px",borderRadius:20}}>{count}</span>}
+      </div>
+      {children}
+    </div>
+  );
+
+  return <div style={{paddingBottom:40}}>
+    {/* Header */}
+    <div style={{background:`linear-gradient(135deg,${COLORS.navy},#1B3A6B)`,borderRadius:16,padding:"20px 22px",marginBottom:24}}>
+      <div style={{color:"rgba(255,255,255,0.6)",fontSize:12,marginBottom:3}}>
+        {new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"})}
+      </div>
+      <div style={{color:"#fff",fontSize:20,fontWeight:700,fontFamily:DISPLAY,marginBottom:2}}>
+        Hi {currentUser.name.split(" ")[0]} 👋
+      </div>
+      <div style={{color:"rgba(255,255,255,0.7)",fontSize:13}}>
+        {todayJobs.length>0
+          ?`${todayJobs.length} job${todayJobs.length>1?"s":""} today — let's go!`
+          :upcomingJobs.length>0
+          ?`${upcomingJobs.length} upcoming job${upcomingJobs.length>1?"s":""}`
+          :"No jobs assigned yet"}
+      </div>
+    </div>
+
+    {/* Today */}
+    {todayJobs.length>0&&<Section title="Today" count={todayJobs.length} accent="#DC2626">
+      {todayJobs.map(j=><JobCard key={j.id} job={j} highlight/>)}
+    </Section>}
+
+    {/* Upcoming */}
+    {upcomingJobs.length>0&&<Section title="Upcoming" count={upcomingJobs.length}>
+      {upcomingJobs.map(j=><JobCard key={j.id} job={j}/>)}
+    </Section>}
+
+    {/* Empty state */}
+    {myJobs.filter(j=>j.status!=="complete").length===0&&<Card style={{textAlign:"center",padding:40}}>
+      <div style={{fontSize:40,marginBottom:12}}>🧹</div>
+      <div style={{fontWeight:700,fontSize:16,color:COLORS.navy,marginBottom:6}}>No jobs assigned yet</div>
+      <div style={{fontSize:13,color:COLORS.slate}}>Jobs will appear here once assigned. Check the Calendar tab to claim available jobs.</div>
+    </Card>}
+
+    {/* Completed */}
+    {doneJobs.length>0&&<div>
+      <button onClick={()=>setShowDone(v=>!v)}
+        style={{background:"none",border:`1.5px solid ${COLORS.border}`,borderRadius:10,padding:"10px 16px",
+                cursor:"pointer",fontFamily:FONT,fontSize:13,fontWeight:600,color:COLORS.slate,
+                width:"100%",marginBottom:12}}>
+        {showDone?"▲ Hide":"▼ Show"} completed jobs ({doneJobs.length})
+      </button>
+      {showDone&&doneJobs.map(j=><JobCard key={j.id} job={j}/>)}
+    </div>}
+
+    {/* Detail modal */}
+    {selected&&<BookingDetailModal
+      detail={{job:selected.job, prop:selected.prop, stay:{start:selected.job.checkinDate||selected.job.checkoutDate, end:selected.job.checkoutDate, nights:1}, isTurnover:false}}
+      onClose={()=>setSelected(null)}
+      currentUser={currentUser}
+      accounts={[]}
+      isCleaner/>}
+  </div>;
+}
+
+// ─── WORKER SCHEDULE VIEW (Landscaper + Garbage) ─────────────────────────────
+function WorkerScheduleView({jobs, jobType, currentUser, properties}) {
+  const db       = useContext(DbCtx);
+  const todayStr = today();
+  const [showDone, setShowDone] = useState(false);
+
+  const icon      = jobType==="landscape" ? "🌿" : "🗑";
+  const accentColor = jobType==="landscape" ? "#059669" : "#6B7280";
+  const dbPath    = jobType==="landscape" ? "landscapeJobs" : "garbageJobs";
+
+  const sorted = jobs.slice().sort((a,b)=>a.scheduledDate.localeCompare(b.scheduledDate));
+  const todayJobs    = sorted.filter(j=>j.scheduledDate===todayStr&&j.status!=="complete");
+  const upcomingJobs = sorted.filter(j=>j.scheduledDate>todayStr &&j.status!=="complete");
+  const doneJobs     = sorted.filter(j=>j.status==="complete").reverse().slice(0,10);
+
+  const markComplete = async job => {
+    await db.ref(`${dbPath}/${job.id}`).update({status:"complete",completedAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
+  };
+
+  const JobCard = ({job, highlight=false}) => {
+    const prop = properties.find(p=>p.id===job.propertyId)||{name:"Unknown",color:"#94A3B8"};
+    const isToday   = job.scheduledDate===todayStr;
+    const dateLabel = isToday ? "Today" : new Date(...job.scheduledDate.split("-").map((v,i)=>i===1?v-1:Number(v)))
+      .toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
+
+    return <div style={{background:"#fff",borderRadius:16,overflow:"hidden",
+        boxShadow:highlight?"0 4px 20px rgba(27,79,216,0.15)":"0 1px 4px rgba(0,0,0,0.07)",
+        border:highlight?`2px solid ${COLORS.blue}`:`1.5px solid ${COLORS.border}`,marginBottom:12}}>
+      <div style={{height:5,background:prop.color,width:"100%"}}/>
+      <div style={{padding:"16px 18px"}}>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:12,gap:8}}>
+          <div>
+            <div style={{fontWeight:700,fontSize:17,color:COLORS.navy,marginBottom:2}}>{prop.name}</div>
+            {prop.address&&<div style={{fontSize:12,color:COLORS.slate}}>{prop.address}</div>}
+          </div>
+          <div style={{flexShrink:0,textAlign:"right"}}>
+            <div style={{fontSize:13,fontWeight:700,color:isToday?"#fff":COLORS.slate,
+                background:isToday?COLORS.blue:"transparent",padding:isToday?"3px 10px":"0",borderRadius:20}}>
+              {dateLabel}
+            </div>
+          </div>
+        </div>
+        {job.notes&&<div style={{fontSize:12,color:COLORS.slate,background:COLORS.surface,padding:"8px 12px",borderRadius:8,marginBottom:12}}>📝 {job.notes}</div>}
+        {job.pickupType&&<div style={{fontSize:12,fontWeight:600,color:accentColor,marginBottom:10}}>{icon} {job.pickupType}</div>}
+        {job.status!=="complete"
+          ?<button onClick={()=>markComplete(job)}
+              style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:"pointer",
+                      background:accentColor,color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700}}>
+              {icon} Mark Complete
+            </button>
+          :<div style={{textAlign:"center",fontSize:13,fontWeight:600,color:"#059669",padding:"6px 0"}}>
+              ✅ Completed {job.completedAt?new Date(job.completedAt).toLocaleDateString("en-US",{month:"short",day:"numeric"}):""}
+            </div>}
+      </div>
+    </div>;
+  };
+
+  const Section = ({title,count,children,accent}) => <div style={{marginBottom:24}}>
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+      <h3 style={{fontFamily:DISPLAY,fontSize:15,fontWeight:700,color:accent||COLORS.navy}}>{title}</h3>
+      {count>0&&<span style={{background:accent||COLORS.blue,color:"#fff",fontSize:11,fontWeight:700,padding:"1px 8px",borderRadius:20}}>{count}</span>}
+    </div>
+    {children}
+  </div>;
+
+  return <div style={{paddingBottom:40}}>
+    <div style={{background:`linear-gradient(135deg,${COLORS.navy},#1B3A6B)`,borderRadius:16,padding:"20px 22px",marginBottom:24}}>
+      <div style={{color:"rgba(255,255,255,0.6)",fontSize:12,marginBottom:3}}>
+        {new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"})}
+      </div>
+      <div style={{color:"#fff",fontSize:20,fontWeight:700,fontFamily:DISPLAY,marginBottom:2}}>
+        Hi {currentUser.name.split(" ")[0]} {icon}
+      </div>
+      <div style={{color:"rgba(255,255,255,0.7)",fontSize:13}}>
+        {todayJobs.length>0?`${todayJobs.length} job${todayJobs.length>1?"s":""} today`
+          :upcomingJobs.length>0?`${upcomingJobs.length} upcoming job${upcomingJobs.length>1?"s":""}`
+          :"No jobs scheduled yet"}
+      </div>
+    </div>
+
+    {todayJobs.length>0&&<Section title="Today" count={todayJobs.length} accent="#DC2626">
+      {todayJobs.map(j=><JobCard key={j.id} job={j} highlight/>)}
+    </Section>}
+
+    {upcomingJobs.length>0&&<Section title="Upcoming" count={upcomingJobs.length}>
+      {upcomingJobs.map(j=><JobCard key={j.id} job={j}/>)}
+    </Section>}
+
+    {jobs.filter(j=>j.status!=="complete").length===0&&<Card style={{textAlign:"center",padding:40}}>
+      <div style={{fontSize:40,marginBottom:12}}>{icon}</div>
+      <div style={{fontWeight:700,fontSize:16,color:COLORS.navy,marginBottom:6}}>No jobs assigned yet</div>
+      <div style={{fontSize:13,color:COLORS.slate}}>Your schedule will appear here once your manager assigns jobs to you.</div>
+    </Card>}
+
+    {doneJobs.length>0&&<div>
+      <button onClick={()=>setShowDone(v=>!v)}
+        style={{background:"none",border:`1.5px solid ${COLORS.border}`,borderRadius:10,padding:"10px 16px",
+                cursor:"pointer",fontFamily:FONT,fontSize:13,fontWeight:600,color:COLORS.slate,width:"100%",marginBottom:12}}>
+        {showDone?"▲ Hide":"▼ Show"} completed ({doneJobs.length})
+      </button>
+      {showDone&&doneJobs.map(j=><JobCard key={j.id} job={j}/>)}
+    </div>}
+  </div>;
+}
+
+// ─── SCHEDULE MANAGER VIEW (Landscape + Garbage manager interface) ────────────
+function ScheduleManagerView({jobs, jobType, accounts, properties, currentUser}) {
+  const db = useContext(DbCtx);
+  const [showNew, setShowNew]   = useState(false);
+  const [filter,  setFilter]    = useState("all");
+  const [newJob,  setNewJob]    = useState({propertyId:"",scheduledDate:"",worker:"",notes:"",pickupType:""});
+
+  const dbPath    = jobType==="landscape" ? "landscapeJobs" : "garbageJobs";
+  const icon      = jobType==="landscape" ? "🌿" : "🗑";
+  const roleKey   = jobType==="landscape" ? "landscaper" : "garbage";
+  const workers   = accounts.filter(a=>a.authorized&&a.role===roleKey).map(a=>a.name);
+
+  const filtered  = filter==="all" ? jobs : jobs.filter(j=>j.status===filter);
+  const sorted    = filtered.slice().sort((a,b)=>a.scheduledDate.localeCompare(b.scheduledDate));
+
+  const addJob = async () => {
+    if (!newJob.propertyId||!newJob.scheduledDate) return;
+    const id = String(Date.now());
+    const now = new Date().toISOString();
+    await db.ref(`${dbPath}/${id}`).set({
+      id, propertyId:newJob.propertyId, scheduledDate:newJob.scheduledDate,
+      worker:newJob.worker||null, status:"pending",
+      notes:newJob.notes||"", pickupType:newJob.pickupType||"",
+      createdAt:now, updatedAt:now,
+    });
+    setShowNew(false); setNewJob({propertyId:"",scheduledDate:"",worker:"",notes:"",pickupType:""});
+  };
+
+  const removeJob = async id => { if (window.confirm("Remove this job?")) await db.ref(`${dbPath}/${id}`).remove(); };
+  const assignWorker = async (id, worker) => { await db.ref(`${dbPath}/${id}`).update({worker:worker||null,updatedAt:new Date().toISOString()}); };
+
+  return <div>
+    <div style={{display:"flex",gap:8,marginBottom:20,flexWrap:"wrap",alignItems:"center"}}>
+      {["all","pending","complete"].map(f=>(
+        <button key={f} onClick={()=>setFilter(f)} style={{padding:"6px 14px",borderRadius:20,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:12,fontWeight:600,background:filter===f?COLORS.blue:COLORS.sky,color:filter===f?"#fff":COLORS.slate}}>
+          {f==="all"?"All":f==="pending"?"Pending":"Completed"}
+        </button>
+      ))}
+      <div style={{flex:1}}/>
+      <Btn small onClick={()=>setShowNew(true)}>{icon} New Job</Btn>
+    </div>
+
+    {showNew&&<Card style={{marginBottom:20,padding:20}}>
+      <div style={{fontWeight:700,fontSize:15,color:COLORS.navy,marginBottom:16}}>{icon} Schedule New Job</div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Property</label>
+          <select value={newJob.propertyId} onChange={e=>setNewJob(v=>({...v,propertyId:e.target.value}))}
+            style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}>
+            <option value="">Select property…</option>
+            {properties.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Scheduled Date</label>
+          <input type="date" value={newJob.scheduledDate} onChange={e=>setNewJob(v=>({...v,scheduledDate:e.target.value}))}
+            style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}/>
+        </div>
+        <div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Assign to</label>
+          <select value={newJob.worker} onChange={e=>setNewJob(v=>({...v,worker:e.target.value}))}
+            style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}>
+            <option value="">Unassigned</option>
+            {workers.map(w=><option key={w} value={w}>{w}</option>)}
+          </select>
+        </div>
+        {jobType==="garbage"&&<div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Pickup Type</label>
+          <select value={newJob.pickupType} onChange={e=>setNewJob(v=>({...v,pickupType:e.target.value}))}
+            style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}>
+            <option value="">General</option>
+            <option value="Garbage">🗑 Garbage</option>
+            <option value="Recycling">♻️ Recycling</option>
+            <option value="Compost">🌱 Compost</option>
+          </select>
+        </div>}
+        <div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Notes (optional)</label>
+          <input value={newJob.notes} onChange={e=>setNewJob(v=>({...v,notes:e.target.value}))} placeholder="Any special instructions…"
+            style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}/>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <Btn onClick={addJob} disabled={!newJob.propertyId||!newJob.scheduledDate}>Save Job</Btn>
+          <Btn variant="ghost" onClick={()=>setShowNew(false)}>Cancel</Btn>
+        </div>
+      </div>
+    </Card>}
+
+    {sorted.length===0?<Card style={{textAlign:"center",padding:36}}>
+      <div style={{fontSize:36,marginBottom:10}}>{icon}</div>
+      <div style={{fontWeight:700,fontSize:15,color:COLORS.navy,marginBottom:6}}>No jobs yet</div>
+      <div style={{fontSize:13,color:COLORS.slate}}>Click "{icon} New Job" to schedule the first one.</div>
+    </Card>:<div style={{display:"flex",flexDirection:"column",gap:10}}>
+      {sorted.map(job=>{
+        const prop = properties.find(p=>p.id===job.propertyId)||{name:"Unknown",color:"#94A3B8"};
+        const dateLabel = new Date(...job.scheduledDate.split("-").map((v,i)=>i===1?v-1:Number(v)))
+          .toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric",year:"numeric"});
+        return <Card key={job.id} style={{padding:"14px 18px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <div style={{width:8,height:40,borderRadius:4,background:prop.color,flexShrink:0}}/>
+            <div style={{flex:1}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                <span style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{prop.name}</span>
+                <Badge config={job.status==="complete"?{label:"Complete",bg:"#D1FAE5",color:"#065F46"}:{label:"Pending",bg:"#FEF3C7",color:"#92400E"}} small/>
+                {job.pickupType&&<span style={{fontSize:11,color:COLORS.slate}}>{job.pickupType}</span>}
+              </div>
+              <div style={{fontSize:12,color:COLORS.slate,marginBottom:6}}>{dateLabel}{job.notes?` · ${job.notes}`:""}</div>
+              <select value={job.worker||""} onChange={e=>assignWorker(job.id,e.target.value)}
+                style={{fontSize:12,padding:"4px 8px",borderRadius:6,border:`1px solid ${COLORS.border}`,background:"#fff"}}>
+                <option value="">Unassigned</option>
+                {workers.map(w=><option key={w} value={w}>{w}</option>)}
+              </select>
+            </div>
+            <button onClick={()=>removeJob(job.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:16,color:COLORS.slate,padding:4}}>🗑</button>
+          </div>
+        </Card>;
+      })}
+    </div>}
+  </div>;
+}
+
+// ─── OPERATIONS CALENDAR ─────────────────────────────────────────────────────
+function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
+  const db = useContext(DbCtx);
+  const [photos,setPhotos]   = useState([]);
+  const [liveJob,setLiveJob] = useState(detail.job||null);
+  const [lightbox,setLightbox] = useState(null);
+  const cleaners = (accounts||[]).filter(a=>a.role==="cleaner").map(a=>a.name);
+
+  useEffect(()=>{
+    if (!detail.job?.id||!db) return;
+    const jobRef   = db.ref(`jobs/${detail.job.id}`);
+    const photoRef = db.ref(`jobPhotos/${detail.job.id}`);
+    jobRef.on("value",   s=>{ if(s.val()) setLiveJob(s.val()); });
+    photoRef.on("value", s=>setPhotos(objArr(s.val())));
+    return ()=>{ jobRef.off(); photoRef.off(); };
+  },[detail.job?.id]);
+
+  const assignCleaner = async val => {
+    if (!liveJob||!db) return;
+    await db.ref(`jobs/${liveJob.id}`).update({cleaner:val||null,updatedAt:new Date().toISOString()});
+  };
+  const updateJobStatus = async status => {
+    if (!liveJob||!db) return;
+    await db.ref(`jobs/${liveJob.id}`).update({status,updatedAt:new Date().toISOString()});
+  };
+  const uploadPhoto = async (e, type) => {
+    const file = e.target.files[0];
+    if (!file||!liveJob) return;
+    const dataUrl = await compressImage(file);
+    const id = String(Date.now());
+    await db.ref(`jobPhotos/${liveJob.id}/${id}`).set({
+      id, jobId:liveJob.id, type, dataUrl,
+      uploadedBy:currentUser.name, uploadedAt:new Date().toISOString()
+    });
+    e.target.value="";
+  };
+  const removePhoto = async id => {
+    if (!liveJob) return;
+    await db.ref(`jobPhotos/${liveJob.id}/${id}`).remove();
+  };
+
+  const beforePhotos = photos.filter(p=>p.type==="before");
+  const afterPhotos  = photos.filter(p=>p.type==="after");
+
+  return <Modal onClose={onClose}>
+    {/* Header */}
+    <div style={{marginBottom:20}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:4,flexWrap:"wrap"}}>
+        <div style={{width:14,height:14,borderRadius:"50%",background:detail.prop.color,flexShrink:0}}/>
+        <h3 style={{fontFamily:DISPLAY,fontSize:20,color:COLORS.navy,margin:0,flex:1}}>{detail.prop.name}</h3>
+        {detail.isTurnover&&<span style={{background:"#FFF7ED",color:"#C2410C",fontWeight:700,fontSize:11,padding:"3px 10px",borderRadius:20,border:"1px solid #FED7AA",whiteSpace:"nowrap"}}>⚡ Same-day turnover</span>}
+      </div>
+      {detail.prop.address&&<div style={{fontSize:13,color:COLORS.slate,marginLeft:24}}>{detail.prop.address}</div>}
+    </div>
+
+    {/* Turnover timer — shown when there's an active cleaning window */}
+    {liveJob?.checkinDate&&<div style={{background:COLORS.surface,borderRadius:12,padding:"14px 16px",marginBottom:14,textAlign:"center"}}>
+      <div style={{fontSize:11,fontWeight:700,color:COLORS.slate,letterSpacing:1,marginBottom:6}}>CLEANING WINDOW</div>
+      <TurnoverTimer job={liveJob} prop={detail.prop} large/>
+    </div>}
+
+    {/* Check-in / checkout */}
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+      <div style={{background:"#DBEAFE",borderRadius:10,padding:"12px 14px"}}>
+        <div style={{fontSize:11,color:"#1D4ED8",fontWeight:700,marginBottom:3}}>CHECK-IN</div>
+        <div style={{fontSize:14,fontWeight:700,color:COLORS.navy}}>{fmtDateLong(detail.stay.start)}</div>
+        <div style={{fontSize:13,color:COLORS.blue,marginTop:2}}>at {detail.prop.checkinTime||"3:00 PM"}</div>
+      </div>
+      <div style={{background:"#FEF3C7",borderRadius:10,padding:"12px 14px"}}>
+        <div style={{fontSize:11,color:"#92400E",fontWeight:700,marginBottom:3}}>CHECKOUT</div>
+        <div style={{fontSize:14,fontWeight:700,color:COLORS.navy}}>{fmtDateLong(detail.stay.end)}</div>
+        <div style={{fontSize:13,color:"#92400E",marginTop:2}}>at {detail.prop.checkoutTime||"11:00 AM"}</div>
+      </div>
+    </div>
+
+    {/* Duration + status */}
+    <div style={{background:COLORS.surface,borderRadius:10,padding:"12px 16px",marginBottom:12,display:"flex",gap:24,flexWrap:"wrap"}}>
+      <div>
+        <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>Duration</div>
+        <div style={{fontSize:17,fontWeight:700,color:COLORS.navy}}>{detail.stay.nights} night{detail.stay.nights!==1?"s":""}</div>
+      </div>
+      {liveJob?.cleaner&&<div>
+        <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>Assigned Cleaner</div>
+        <div style={{fontSize:14,fontWeight:700,color:COLORS.navy}}>👤 {liveJob.cleaner}</div>
+      </div>}
+      {liveJob?.status&&<div>
+        <div style={{fontSize:11,color:COLORS.slate,marginBottom:4}}>Clean Status</div>
+        <Badge config={jobStatusCfg[liveJob.status]} small/>
+      </div>}
+    </div>
+
+    {/* Turnover warning */}
+    {detail.isTurnover&&<div style={{background:"#FFF7ED",borderRadius:10,padding:"12px 14px",border:"1px solid #FED7AA",marginBottom:12}}>
+      <div style={{fontWeight:700,fontSize:13,color:"#C2410C",marginBottom:4}}>⚡ Urgent — Same-day Turnover</div>
+      <div style={{fontSize:12,color:"#92400E",lineHeight:1.65}}>
+        Clean window: <strong>{detail.prop.checkoutTime||"11:00 AM"}</strong> → <strong>{detail.prop.checkinTime||"3:00 PM"}</strong>
+      </div>
+    </div>}
+
+    {/* Job management — only when there's a job */}
+    {liveJob&&<div style={{borderTop:`1px solid ${COLORS.border}`,paddingTop:14,marginBottom:14}}>
+      <div style={{fontWeight:700,fontSize:13,color:COLORS.navy,marginBottom:10}}>Cleaning Job</div>
+
+      {/* Cleaner: self-assign (cleaner role) */}
+      {isCleaner&&<div style={{marginBottom:10}}>
+        {!liveJob.cleaner&&<Btn variant="outline" small onClick={()=>assignCleaner(currentUser.name)}
+          style={{width:"100%",justifyContent:"center",marginBottom:6}}>✋ Claim This Job</Btn>}
+        {liveJob.cleaner&&liveJob.cleaner!==currentUser.name&&
+          <div style={{fontSize:12,color:COLORS.slate,marginBottom:6,fontStyle:"italic"}}>Assigned to {liveJob.cleaner}</div>}
+        {liveJob.cleaner===currentUser.name&&<>
+          {liveJob.status==="pending"&&<>
+            <Btn variant="amber" small onClick={()=>updateJobStatus("in-progress")}
+              style={{width:"100%",justifyContent:"center",marginBottom:6}}>🕐 Start Cleaning</Btn>
+            <Btn variant="ghost" small onClick={()=>assignCleaner(null)}
+              style={{width:"100%",justifyContent:"center"}}>Unclaim</Btn>
+          </>}
+          {liveJob.status==="in-progress"&&<Btn variant="green" small onClick={()=>updateJobStatus("complete")}
+            style={{width:"100%",justifyContent:"center",marginBottom:6}}>✓ Mark Complete</Btn>}
+        </>}
+      </div>}
+
+      {/* Cleaner: manager/owner assignment dropdown */}
+      {!isCleaner&&<div style={{marginBottom:10}}>
+        <select value={liveJob.cleaner||""} onChange={e=>assignCleaner(e.target.value||null)}
+          style={{width:"100%",padding:"8px 10px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13,marginBottom:6,background:"#fff"}}>
+          <option value="">Unassigned</option>
+          {cleaners.map(c=><option key={c} value={c}>{c}</option>)}
+        </select>
+        {liveJob.status==="pending"&&<Btn variant="amber" small onClick={()=>updateJobStatus("in-progress")}
+          style={{width:"100%",justifyContent:"center",marginBottom:6}}>🕐 Mark In Progress</Btn>}
+        {liveJob.status==="in-progress"&&<Btn variant="green" small onClick={()=>updateJobStatus("complete")}
+          style={{width:"100%",justifyContent:"center"}}>✓ Mark Complete</Btn>}
+      </div>}
+
+      {/* Photo upload */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+        <label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"8px 0",borderRadius:8,border:`1.5px dashed ${COLORS.border}`,cursor:"pointer",fontSize:12,color:COLORS.slate,fontWeight:600}}>
+          📷 Before
+          <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>uploadPhoto(e,"before")}/>
+        </label>
+        <label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"8px 0",borderRadius:8,border:`1.5px dashed ${COLORS.border}`,cursor:"pointer",fontSize:12,color:COLORS.slate,fontWeight:600}}>
+          ✅ After
+          <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>uploadPhoto(e,"after")}/>
+        </label>
+      </div>
+
+      {/* Photo grid */}
+      {photos.length>0&&<div>
+        {beforePhotos.length>0&&<div style={{marginBottom:8}}>
+          <div style={{fontSize:11,fontWeight:700,color:COLORS.slate,marginBottom:6}}>BEFORE ({beforePhotos.length})</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {beforePhotos.map(p=><div key={p.id} style={{position:"relative"}}>
+              <img src={p.dataUrl} alt="before" onClick={()=>setLightbox(p.dataUrl)}
+                style={{width:70,height:70,objectFit:"cover",borderRadius:8,cursor:"pointer",border:`2px solid ${COLORS.border}`}}/>
+              <button onClick={()=>removePhoto(p.id)}
+                style={{position:"absolute",top:-6,right:-6,background:"#EF4444",color:"#fff",border:"none",borderRadius:"50%",width:18,height:18,fontSize:11,cursor:"pointer",lineHeight:"18px",padding:0}}>×</button>
+            </div>)}
+          </div>
+        </div>}
+        {afterPhotos.length>0&&<div>
+          <div style={{fontSize:11,fontWeight:700,color:COLORS.slate,marginBottom:6}}>AFTER ({afterPhotos.length})</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {afterPhotos.map(p=><div key={p.id} style={{position:"relative"}}>
+              <img src={p.dataUrl} alt="after" onClick={()=>setLightbox(p.dataUrl)}
+                style={{width:70,height:70,objectFit:"cover",borderRadius:8,cursor:"pointer",border:`2px solid ${COLORS.green}`}}/>
+              <button onClick={()=>removePhoto(p.id)}
+                style={{position:"absolute",top:-6,right:-6,background:"#EF4444",color:"#fff",border:"none",borderRadius:"50%",width:18,height:18,fontSize:11,cursor:"pointer",lineHeight:"18px",padding:0}}>×</button>
+            </div>)}
+          </div>
+        </div>}
+      </div>}
+    </div>}
+
+    {/* Lightbox */}
+    {lightbox&&<div onClick={()=>setLightbox(null)}
+      style={{position:"fixed",inset:0,background:"rgba(0,0,0,.85)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <img src={lightbox} style={{maxWidth:"90vw",maxHeight:"90vh",borderRadius:12,boxShadow:"0 8px 40px #0008"}}/>
+    </div>}
+  </Modal>;
+}
+
+function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
+  const calRef  = useRef(null);
+  const fcRef   = useRef(null);
+  const [detail,    setDetail]     = useState(null);
+  const [hidden,    setHidden]     = useState(new Set());
+  const [showFilter,setShowFilter] = useState(false);
+
+  // Return set of "propId_date" that are same-day turnovers
+  const getTurnovers = arr => {
+    const checkouts = new Set(arr.map(s=>`${s.propId}_${s.end}`));
+    const res = new Set();
+    arr.forEach(s=>{ if(checkouts.has(`${s.propId}_${s.start}`)) res.add(`${s.propId}_${s.start}`); });
+    return res;
+  };
+
+  const buildEvents = (staysArr,propsArr,jobsArr,hiddenSet) => {
+    const turnovers = getTurnovers(staysArr);
+    return staysArr.filter(s=>!hiddenSet.has(s.propId)).map(s=>{
+      const prop = propsArr.find(p=>p.id===s.propId);
+      if (!prop) return null;
+      const job = jobsArr.find(j=>j.propertyId===s.propId&&j.checkoutDate===s.end);
+      const isTurnover = turnovers.has(`${s.propId}_${s.start}`);
+      return {
+        id: s.uid, start: s.start, end: s.end, allDay: true, title: prop.name,
+        backgroundColor: prop.color, borderColor: prop.color,
+        classNames: isTurnover?['fc-ev-turnover']:[],
+        extendedProps: {stay:s,prop,job,isTurnover},
+      };
+    }).filter(Boolean);
+  };
+
+  // Init FullCalendar once
+  useEffect(()=>{
+    if (!calRef.current||typeof FullCalendar==='undefined') return;
+    const cal = new FullCalendar.Calendar(calRef.current,{
+      initialView:'dayGridMonth',
+      headerToolbar:{left:'prev,next today',center:'title',right:'dayGridMonth,dayGridWeek,listWeek'},
+      buttonText:{today:'Today',month:'Month',week:'Week',list:'Agenda'},
+      fixedWeekCount:false, dayMaxEvents:4, height:'auto',
+      eventContent: arg=>{
+        const {isTurnover}=arg.event.extendedProps;
+        const wrap=document.createElement('div');
+        wrap.style.cssText='display:flex;align-items:center;gap:3px;padding:1px 5px;overflow:hidden;width:100%;min-width:0';
+        if(isTurnover){const b=document.createElement('span');b.textContent='⚡';b.style.cssText='font-size:9px;flex-shrink:0;line-height:1';wrap.appendChild(b);}
+        const t=document.createElement('span');
+        t.textContent=arg.event.title;
+        t.style.cssText='font-size:11px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;line-height:1.5';
+        wrap.appendChild(t);
+        return {domNodes:[wrap]};
+      },
+      eventClick: info=>setDetail(info.event.extendedProps),
+      eventDidMount: arg=>{
+        if(arg.event.extendedProps.isTurnover){arg.el.style.borderLeft='3px solid #F97316';}
+        // Tooltip with checkin/checkout times
+        const {prop,stay}=arg.event.extendedProps;
+        arg.el.title=`${prop.name}\nCheck-in: ${stay.start} at ${prop.checkinTime||'3:00 PM'}\nCheckout: ${stay.end} at ${prop.checkoutTime||'11:00 AM'}\n${stay.nights} nights`;
+      },
+    });
+    cal.render(); fcRef.current=cal;
+    return ()=>{cal.destroy();fcRef.current=null;};
+  },[]);
+
+  // Refresh events when data/filters change
+  useEffect(()=>{
+    if (!fcRef.current) return;
+    fcRef.current.removeAllEventSources();
+    fcRef.current.addEventSource(buildEvents(stays,properties,jobs,hidden));
+  },[stays,properties,jobs,hidden]);
+
+  const toggle   = id=>setHidden(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n;});
+  const showAll  = ()=>setHidden(new Set());
+  const hideAll  = ()=>setHidden(new Set(properties.map(p=>p.id)));
+  const vis      = properties.length-hidden.size;
+
+  return <div>
+    {/* Filter bar */}
+    <div style={{marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:showFilter?12:0,flexWrap:"wrap"}}>
+        <Btn small variant={showFilter?"primary":"outline"} onClick={()=>setShowFilter(v=>!v)}>
+          🏠 {vis<properties.length?`${vis}/${properties.length} Properties`:`${properties.length} Properties`} {showFilter?"▲":"▼"}
+        </Btn>
+        {!showFilter&&properties.length>0&&<div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",flex:1}}>
+          {properties.slice(0,10).map(p=>(
+            <div key={p.id} onClick={()=>toggle(p.id)} title={p.name}
+              style={{display:"flex",alignItems:"center",gap:4,cursor:"pointer",opacity:hidden.has(p.id)?.4:1,padding:"3px 9px",borderRadius:20,border:`1.5px solid ${hidden.has(p.id)?COLORS.border:p.color}`,background:hidden.has(p.id)?"transparent":p.color+"1A",transition:"all .15s"}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:p.color}}/>
+              <span style={{fontSize:11,fontWeight:600,color:hidden.has(p.id)?COLORS.slate:COLORS.navy,whiteSpace:"nowrap",maxWidth:90,overflow:"hidden",textOverflow:"ellipsis"}}>{p.name}</span>
+            </div>
+          ))}
+          {properties.length>10&&<span style={{fontSize:11,color:COLORS.slate}}>+{properties.length-10} more</span>}
+          <div style={{display:"flex",alignItems:"center",gap:5,marginLeft:"auto",flexShrink:0}}>
+            <div style={{width:20,height:12,borderRadius:3,background:"#1B4FD8",borderLeft:"3px solid #F97316",flexShrink:0}}/>
+            <span style={{fontSize:11,color:COLORS.slate,whiteSpace:"nowrap"}}>⚡ Same-day turnover</span>
+          </div>
+        </div>}
+      </div>
+
+      {showFilter&&<Card style={{padding:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+          <span style={{fontWeight:700,fontSize:14,color:COLORS.navy,flex:1}}>Filter Properties</span>
+          <Btn small variant="ghost" onClick={showAll}>Show All</Btn>
+          <Btn small variant="ghost" onClick={hideAll}>Hide All</Btn>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:8}}>
+          {properties.map(p=>{
+            const h=hidden.has(p.id);
+            return <div key={p.id} onClick={()=>toggle(p.id)}
+              style={{display:"flex",alignItems:"center",gap:8,padding:"9px 12px",borderRadius:10,cursor:"pointer",background:h?"#F8FAFF":p.color+"1A",border:`1.5px solid ${h?COLORS.border:p.color}`,transition:"all .15s"}}>
+              <div style={{width:12,height:12,borderRadius:"50%",background:h?"#CBD5E1":p.color,flexShrink:0}}/>
+              <span style={{fontSize:12,fontWeight:600,color:h?COLORS.slate:COLORS.navy,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</span>
+              <span style={{fontSize:11,fontWeight:600,color:h?COLORS.slate:COLORS.green,flexShrink:0}}>{h?"Hidden":"✓"}</span>
+            </div>;
+          })}
+        </div>
+        <div style={{marginTop:14,paddingTop:12,borderTop:`1px solid ${COLORS.border}`,display:"flex",gap:16,flexWrap:"wrap",alignItems:"center"}}>
+          <span style={{fontSize:12,fontWeight:700,color:COLORS.slate}}>Legend</span>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{width:22,height:13,borderRadius:3,background:"#1B4FD8",borderLeft:"3px solid #F97316"}}/>
+            <span style={{fontSize:11,color:COLORS.slate}}>⚡ Same-day turnover — urgent clean window</span>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{width:22,height:13,borderRadius:3,background:"#1B4FD8"}}/>
+            <span style={{fontSize:11,color:COLORS.slate}}>Regular booking</span>
+          </div>
+        </div>
+      </Card>}
+    </div>
+
+    {/* FullCalendar */}
+    {typeof FullCalendar==='undefined'
+      ?<Card style={{textAlign:"center",padding:40}}><div style={{fontSize:13,color:COLORS.slate}}>⏳ Loading calendar…</div></Card>
+      :<Card style={{padding:12,overflow:"hidden"}}><div ref={calRef}/></Card>}
+
+    {properties.length===0&&<Card style={{textAlign:"center",padding:36,marginTop:16}}>
+      <div style={{fontSize:36,marginBottom:10}}>📅</div>
+      <div style={{fontWeight:700,fontSize:15,color:COLORS.navy,marginBottom:6}}>No bookings yet</div>
+      <div style={{fontSize:13,color:COLORS.slate}}>Owners can add properties and sync Airbnb iCal from the <strong>Sync</strong> tab.</div>
+    </Card>}
+
+    {/* Booking detail modal */}
+    {detail&&<BookingDetailModal detail={detail} onClose={()=>setDetail(null)} currentUser={currentUser} accounts={accounts} isCleaner={currentUser?.role==="cleaner"}/>}
+  </div>;
+}
+
+// ─── MAINTENANCE ─────────────────────────────────────────────────────────────
+function SubmitMaintenanceModal({onClose,properties,currentUser,maintenance}) {
+  const db = useContext(DbCtx);
+  const [propId,setPropId]   = useState(properties[0]?.id||"");
+  const [cat,setCat]         = useState("");
+  const [title,setTitle]     = useState("");
+  const [desc,setDesc]       = useState("");
+  const [urgency,setUrgency] = useState("medium");
+  const [photos,setPhotos]   = useState([]);
+  const [uploading,setUploading] = useState(false);
+  const [err,setErr]         = useState("");
+  const [saving,setSaving]   = useState(false);
+
+  const existingOpen = (maintenance||[]).filter(t=>t.propertyId===propId&&t.status!=="resolved");
+
+  const addConfirmation = async ticketId => {
+    const now = new Date().toISOString();
+    await db.ref(`maintenance/${ticketId}/confirmations/${currentUser.id}`).set({name:currentUser.name,at:now});
+    await db.ref(`maintenance/${ticketId}`).update({updatedAt:now});
+  };
+  const removeConfirmation = async ticketId => {
+    await db.ref(`maintenance/${ticketId}/confirmations/${currentUser.id}`).remove();
+    await db.ref(`maintenance/${ticketId}`).update({updatedAt:new Date().toISOString()});
+  };
+
+  const addPhoto = async e => {
+    const files = Array.from(e.target.files||[]);
+    if (photos.length+files.length>5){setErr("Maximum 5 photos.");return;}
+    setUploading(true);
+    const compressed = await Promise.all(files.map(f=>compressImage(f)));
+    setPhotos(p=>[...p,...compressed.map((dataUrl,i)=>({id:String(Date.now())+i,dataUrl}))]);
+    setUploading(false); e.target.value="";
+  };
+
+  const submit = async () => {
+    if (!propId){setErr("Select a property.");return;}
+    if (!cat){setErr("Select a category.");return;}
+    if (!title.trim()){setErr("Enter a title.");return;}
+    if (!desc.trim()){setErr("Describe the issue.");return;}
+    setSaving(true); setErr("");
+    const id = String(Date.now());
+    const photoObj = {}; photos.forEach(p=>{photoObj[p.id]=p;});
+    const now = new Date().toISOString();
+    await db.ref(`maintenance/${id}`).set({
+      id,propertyId:propId,category:cat,title:title.trim(),description:desc.trim(),
+      urgency,status:"open",submittedBy:currentUser.name,submittedById:currentUser.id,
+      submittedAt:now,updatedAt:now,photos:photoObj,note:"",noteBy:"",noteAt:""
+    });
+    onClose();
+  };
+
+  return <Modal onClose={onClose} wide>
+    <h3 style={{fontFamily:DISPLAY,fontSize:20,color:COLORS.navy,marginBottom:20}}>Submit Maintenance Request</h3>
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      <div>
+        <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Property</label>
+        <select value={propId} onChange={e=>setPropId(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+          {properties.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+      </div>
+
+      {/* Existing open tickets for this property */}
+      {existingOpen.length>0&&<div style={{background:"#FFFBEB",borderRadius:10,padding:"12px 14px",border:"1px solid #FDE68A"}}>
+        <div style={{fontWeight:700,fontSize:13,color:"#92400E",marginBottom:10}}>
+          ⚠️ {existingOpen.length} open request{existingOpen.length>1?"s":""} already logged for this property — check before submitting a new one
+        </div>
+        {existingOpen.map(t=>{
+          const confirmed = t.confirmations&&t.confirmations[currentUser.id];
+          const confCount = Object.keys(t.confirmations||{}).length;
+          return <div key={t.id} style={{background:"#fff",borderRadius:8,padding:"10px 12px",marginBottom:7,border:`1px solid ${COLORS.border}`}}>
+            <div style={{display:"flex",alignItems:"center",gap:7,flexWrap:"wrap",marginBottom:4}}>
+              <Badge config={urgencyCfg[t.urgency]} small/>
+              <span style={{fontWeight:600,fontSize:13,color:COLORS.navy,flex:1}}>{t.title}</span>
+              <Badge config={maintStatusCfg[t.status]} small/>
+            </div>
+            <div style={{fontSize:11,color:COLORS.slate,marginBottom:6}}>{t.category} · by {t.submittedBy}{confCount>0?` · 👁 ${confCount} confirmation${confCount>1?"s":""}`:""}</div>
+            {confirmed
+              ?<div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontSize:12,color:COLORS.green,fontWeight:600}}>✓ You've confirmed this issue</span>
+                <span onClick={()=>removeConfirmation(t.id)} style={{fontSize:11,color:COLORS.slate,cursor:"pointer",textDecoration:"underline"}}>Undo</span>
+              </div>
+              :<Btn small variant="outline" onClick={()=>addConfirmation(t.id)}>👁 I've seen this too</Btn>}
+          </div>;
+        })}
+        <div style={{fontSize:11,color:"#92400E",marginTop:6}}>If your issue is already listed above, use "I've seen this too" instead of creating a duplicate.</div>
+      </div>}
+
+      <div>
+        <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Issue Category</label>
+        <select value={cat} onChange={e=>setCat(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+          <option value="">Select category…</option>
+          {MAINT_CATS.map(c=><option key={c} value={c}>{c}</option>)}
+        </select>
+      </div>
+      <FieldInput label='Issue Title' value={title} onChange={e=>setTitle(e.target.value)} placeholder='e.g. "Leaky faucet under kitchen sink"'/>
+      <div>
+        <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Description</label>
+        <textarea value={desc} onChange={e=>setDesc(e.target.value)} placeholder="Describe the issue in detail…"
+          style={{width:"100%",height:90,padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13,resize:"vertical",boxSizing:"border-box"}}/>
+      </div>
+      <div>
+        <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:8}}>Urgency</label>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+          {[["low","🟢 Low","Fix when possible"],["medium","🟡 Medium","Address soon"],["urgent","🔴 Urgent","Needs immediate attention"]].map(([v,l,d])=>(
+            <div key={v} onClick={()=>setUrgency(v)} style={{padding:"10px 12px",borderRadius:10,cursor:"pointer",border:`2px solid ${urgency===v?COLORS.blue:COLORS.border}`,background:urgency===v?COLORS.sky:"#fff",transition:"all .15s"}}>
+              <div style={{fontSize:13,fontWeight:700,color:urgency===v?COLORS.blue:COLORS.navy,marginBottom:2}}>{l}</div>
+              <div style={{fontSize:11,color:COLORS.slate}}>{d}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div>
+        <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:8}}>Photos (optional, up to 5)</label>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+          {photos.map(p=>(
+            <div key={p.id} style={{position:"relative"}}>
+              <img src={p.dataUrl} style={{width:72,height:72,objectFit:"cover",borderRadius:8,border:`1px solid ${COLORS.border}`}}/>
+              <button onClick={()=>setPhotos(ph=>ph.filter(x=>x.id!==p.id))} style={{position:"absolute",top:-6,right:-6,width:18,height:18,borderRadius:"50%",background:COLORS.red,color:"#fff",border:"2px solid #fff",cursor:"pointer",fontSize:10,display:"flex",alignItems:"center",justifyContent:"center",padding:0}}>×</button>
+            </div>
+          ))}
+          {photos.length<5&&<label style={{width:72,height:72,borderRadius:8,border:`2px dashed ${COLORS.border}`,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",cursor:"pointer",fontSize:11,color:COLORS.slate,gap:3}}>
+            {uploading?"…":"📷"}<span style={{textAlign:"center"}}>{uploading?"Adding…":"Add Photo"}</span>
+            <input type="file" accept="image/*" multiple onChange={addPhoto} style={{display:"none"}}/>
+          </label>}
+        </div>
+      </div>
+    </div>
+    <ErrBox msg={err}/>
+    <div style={{display:"flex",gap:10,marginTop:20}}>
+      <Btn onClick={submit} disabled={saving}>{saving?"Submitting…":"Submit Request"}</Btn>
+      <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+    </div>
+  </Modal>;
+}
+
+function MaintenanceView({maintenance,properties,currentUser}) {
+  const db = useContext(DbCtx);
+  const isCleaner = currentUser.role==="cleaner";
+  const isOwner   = !isCleaner;
+  const [showSubmit,setShowSubmit]       = useState(false);
+  const [viewId,setViewId]               = useState(null);
+  const [filterStatus,setFilterStatus]   = useState("all");
+  const [filterProp,setFilterProp]       = useState("all");
+  const [filterUrgency,setFilterUrgency] = useState("all");
+  const [editNoteId,setEditNoteId]       = useState(null);
+  const [noteText,setNoteText]           = useState("");
+  const [commentText,setCommentText]     = useState("");
+  const [lightbox,setLightbox]           = useState(null);
+
+  // Everyone sees all tickets — no role filter
+  let tickets = [...maintenance];
+  if (filterStatus!=="all")  tickets = tickets.filter(t=>t.status===filterStatus);
+  if (filterProp!=="all")    tickets = tickets.filter(t=>t.propertyId===filterProp);
+  if (filterUrgency!=="all") tickets = tickets.filter(t=>t.urgency===filterUrgency);
+  // Sort: urgent unresolved first, then by most recently updated/submitted
+  tickets.sort((a,b)=>{
+    const uo={urgent:0,medium:1,low:2};
+    const aRes=a.status==="resolved", bRes=b.status==="resolved";
+    if (aRes!==bRes) return aRes?1:-1;
+    if (!aRes&&!bRes&&uo[a.urgency]!==uo[b.urgency]) return uo[a.urgency]-uo[b.urgency];
+    return (b.updatedAt||b.submittedAt).localeCompare(a.updatedAt||a.submittedAt);
+  });
+
+  const openCount   = maintenance.filter(t=>t.status!=="resolved").length;
+  const urgentCount = maintenance.filter(t=>t.urgency==="urgent"&&t.status!=="resolved").length;
+
+  const updateStatus = async (id,st) => {
+    const now = new Date().toISOString();
+    await db.ref(`maintenance/${id}`).update({status:st,updatedAt:now,...(st==="resolved"?{resolvedAt:now}:{})});
+  };
+  const saveNote = async id => {
+    const now = new Date().toISOString();
+    await db.ref(`maintenance/${id}`).update({note:noteText.trim(),noteBy:currentUser.name,noteAt:now,updatedAt:now});
+    setEditNoteId(null); setNoteText("");
+  };
+  const addComment = async id => {
+    if (!commentText.trim()) return;
+    const cid = String(Date.now()); const now = new Date().toISOString();
+    await db.ref(`maintenance/${id}/comments/${cid}`).set({id:cid,text:commentText.trim(),by:currentUser.name,byId:currentUser.id,at:now});
+    await db.ref(`maintenance/${id}`).update({updatedAt:now});
+    setCommentText("");
+  };
+  const addConfirmation = async id => {
+    const now = new Date().toISOString();
+    await db.ref(`maintenance/${id}/confirmations/${currentUser.id}`).set({name:currentUser.name,at:now});
+    await db.ref(`maintenance/${id}`).update({updatedAt:now});
+  };
+  const removeConfirmation = async id => {
+    await db.ref(`maintenance/${id}/confirmations/${currentUser.id}`).remove();
+    await db.ref(`maintenance/${id}`).update({updatedAt:new Date().toISOString()});
+  };
+  const deleteTicket = async id => {
+    if (!confirm("Delete this ticket permanently?")) return;
+    await db.ref(`maintenance/${id}`).remove();
+    if (viewId===id) setViewId(null);
+  };
+
+  const ticket  = viewId ? (maintenance.find(m=>m.id===viewId)||null) : null;
+  const nextSt  = ticket ? NEXT_MAINT[ticket.status] : null;
+  const myConf  = ticket && ticket.confirmations && ticket.confirmations[currentUser.id];
+  const confArr = ticket ? objArr(ticket.confirmations||{}) : [];
+  const comments= ticket ? objArr(ticket.comments||{}).sort((a,b)=>a.at.localeCompare(b.at)) : [];
+
+  return <div>
+    {/* Stats banner — all roles if there are open tickets */}
+    {openCount>0&&<div style={{display:"grid",gridTemplateColumns:urgentCount>0?"1fr 1fr":"1fr",gap:12,marginBottom:20}}>
+      <div style={{background:"#FEE2E2",borderRadius:14,padding:"14px 20px",display:"flex",gap:14,alignItems:"center"}}>
+        <span style={{fontSize:28}}>🔧</span>
+        <div><div style={{fontSize:26,fontWeight:700,color:COLORS.red,fontFamily:DISPLAY}}>{openCount}</div><div style={{fontSize:12,color:COLORS.slate}}>Open Tickets</div></div>
+      </div>
+      {urgentCount>0&&<div style={{background:"#FEF2F2",borderRadius:14,padding:"14px 20px",display:"flex",gap:14,alignItems:"center",border:"1px solid #FCA5A5"}}>
+        <span style={{fontSize:28}}>🚨</span>
+        <div><div style={{fontSize:26,fontWeight:700,color:"#991B1B",fontFamily:DISPLAY}}>{urgentCount}</div><div style={{fontSize:12,color:COLORS.slate}}>Urgent</div></div>
+      </div>}
+    </div>}
+
+    {/* Toolbar — filters available to everyone */}
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:18,flexWrap:"wrap"}}>
+      <Btn small onClick={()=>setShowSubmit(true)}>🔧 Submit Request</Btn>
+      <div style={{flex:1}}/>
+      <select value={filterProp} onChange={e=>setFilterProp(e.target.value)} style={{padding:"6px 10px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:12,color:COLORS.navy}}>
+        <option value="all">All Properties</option>
+        {properties.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+      </select>
+      <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} style={{padding:"6px 10px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:12,color:COLORS.navy}}>
+        <option value="all">All Statuses</option>
+        {Object.entries(maintStatusCfg).map(([v,c])=><option key={v} value={v}>{c.label}</option>)}
+      </select>
+      <select value={filterUrgency} onChange={e=>setFilterUrgency(e.target.value)} style={{padding:"6px 10px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:12,color:COLORS.navy}}>
+        <option value="all">All Urgency</option>
+        {Object.entries(urgencyCfg).map(([v,c])=><option key={v} value={v}>{c.label}</option>)}
+      </select>
+    </div>
+
+    {/* Ticket list */}
+    {tickets.length===0
+      ?<Card style={{textAlign:"center",padding:40}}>
+        <div style={{fontSize:36,marginBottom:12}}>🔧</div>
+        <div style={{fontWeight:700,fontSize:16,color:COLORS.navy,marginBottom:6}}>No maintenance tickets</div>
+        <div style={{fontSize:13,color:COLORS.slate}}>No tickets match your filters. Tap "Submit Request" to log a new issue.</div>
+      </Card>
+      :tickets.map(t=>{
+        const prop=getProp(t.propertyId,properties);
+        const pCount=Object.keys(t.photos||{}).length;
+        const cCount=Object.keys(t.comments||{}).length;
+        const confCount=Object.keys(t.confirmations||{}).length;
+        const mine=t.submittedById===currentUser.id;
+        return <Card key={t.id} onClick={()=>setViewId(t.id)} style={{padding:"14px 18px",marginBottom:10}}>
+          <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+            <div style={{width:4,alignSelf:"stretch",borderRadius:4,background:t.urgency==="urgent"?COLORS.red:prop.color,flexShrink:0}}/>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:4}}>
+                <span style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{t.title}</span>
+                <Badge config={urgencyCfg[t.urgency]} small/>
+                <Badge config={maintStatusCfg[t.status]} small/>
+                {mine&&<span style={{fontSize:10,fontWeight:700,color:COLORS.blue,background:COLORS.sky,padding:"1px 6px",borderRadius:20}}>Mine</span>}
+              </div>
+              <div style={{fontSize:12,color:COLORS.slate,marginBottom:2}}>{prop.name} · {t.category} · by {t.submittedBy}</div>
+              <div style={{fontSize:11,color:COLORS.slate,display:"flex",gap:10,flexWrap:"wrap"}}>
+                <span>{new Date(t.updatedAt||t.submittedAt).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}</span>
+                {cCount>0&&<span>💬 {cCount}</span>}
+                {confCount>0&&<span>👁 {confCount}</span>}
+                {pCount>0&&<span>📷 {pCount}</span>}
+                {t.note&&<span style={{color:COLORS.blue}}>📝</span>}
+              </div>
+            </div>
+            <span style={{color:COLORS.slate,fontSize:18,flexShrink:0}}>›</span>
+          </div>
+        </Card>;
+      })}
+
+    {showSubmit&&<SubmitMaintenanceModal onClose={()=>setShowSubmit(false)} properties={properties} currentUser={currentUser} maintenance={maintenance}/>}
+
+    {/* Detail modal */}
+    {ticket&&<Modal onClose={()=>setViewId(null)} wide>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:20,flexWrap:"wrap"}}>
+        <div style={{width:12,height:12,borderRadius:"50%",background:getProp(ticket.propertyId,properties).color,flexShrink:0}}/>
+        <h3 style={{fontFamily:DISPLAY,fontSize:18,color:COLORS.navy,margin:0,flex:1}}>{ticket.title}</h3>
+        <Badge config={urgencyCfg[ticket.urgency]}/>
+        <Badge config={maintStatusCfg[ticket.status]}/>
+        {isOwner&&<Btn small variant="red" onClick={()=>deleteTicket(ticket.id)}>Delete</Btn>}
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+        {[["Property",getProp(ticket.propertyId,properties).name],["Category",ticket.category],["Submitted by",ticket.submittedBy],["Submitted",new Date(ticket.submittedAt).toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})],...(ticket.resolvedAt?[["Resolved",new Date(ticket.resolvedAt).toLocaleDateString()]]:[])]
+          .map(([l,v])=><div key={l} style={{background:COLORS.surface,borderRadius:10,padding:"10px 14px"}}>
+            <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>{l}</div>
+            <div style={{fontSize:13,fontWeight:600,color:COLORS.navy}}>{v}</div>
+          </div>)}
+      </div>
+
+      <div style={{background:COLORS.surface,borderRadius:10,padding:"12px 14px",marginBottom:14}}>
+        <div style={{fontSize:11,color:COLORS.slate,marginBottom:6}}>Description</div>
+        <div style={{fontSize:13,color:COLORS.navy,lineHeight:1.65}}>{ticket.description}</div>
+      </div>
+
+      {/* Confirmations */}
+      <div style={{background:"#FFFBEB",borderRadius:10,padding:"10px 14px",marginBottom:14,border:"1px solid #FDE68A"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:confArr.length>0?8:0}}>
+          <span style={{fontSize:12,fontWeight:700,color:"#92400E"}}>👁 Seen by {confArr.length} user{confArr.length!==1?"s":""}</span>
+          {myConf
+            ?<span onClick={()=>removeConfirmation(ticket.id)} style={{fontSize:11,color:COLORS.slate,cursor:"pointer",textDecoration:"underline",marginLeft:4}}>Undo</span>
+            :<Btn small variant="ghost" onClick={()=>addConfirmation(ticket.id)} style={{marginLeft:4}}>I've seen this too</Btn>}
+        </div>
+        {confArr.length>0&&<div style={{fontSize:11,color:"#92400E"}}>{confArr.map(c=>c.name).join(", ")}</div>}
+      </div>
+
+      {/* Photos */}
+      {Object.keys(ticket.photos||{}).length>0&&<div style={{marginBottom:14}}>
+        <div style={{fontSize:12,fontWeight:700,color:COLORS.slate,marginBottom:8}}>Photos ({Object.keys(ticket.photos).length})</div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          {objArr(ticket.photos).map(p=>(
+            <img key={p.id} src={p.dataUrl} onClick={()=>setLightbox(p.dataUrl)}
+              style={{width:84,height:84,objectFit:"cover",borderRadius:8,cursor:"zoom-in",border:`1px solid ${COLORS.border}`}}/>
+          ))}
+        </div>
+      </div>}
+
+      {/* Owner note — owners/managers edit, all can read */}
+      <div style={{background:"#EEF2FF",borderRadius:10,padding:"12px 14px",marginBottom:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+          <span style={{fontSize:12,fontWeight:700,color:COLORS.navy}}>📝 Owner Note</span>
+          {isOwner&&editNoteId!==ticket.id&&<span onClick={()=>{setEditNoteId(ticket.id);setNoteText(ticket.note||"");}} style={{fontSize:11,color:COLORS.blue,cursor:"pointer",fontWeight:600}}>{ticket.note?"Edit":"Add Note"}</span>}
+        </div>
+        {editNoteId===ticket.id
+          ?<div>
+            <textarea value={noteText} onChange={e=>setNoteText(e.target.value)} placeholder="Add a note visible to everyone…"
+              style={{width:"100%",height:70,padding:"8px 10px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:12,resize:"vertical",boxSizing:"border-box"}}/>
+            <div style={{display:"flex",gap:8,marginTop:8}}>
+              <Btn small onClick={()=>saveNote(ticket.id)}>Save</Btn>
+              <Btn small variant="ghost" onClick={()=>setEditNoteId(null)}>Cancel</Btn>
+            </div>
+          </div>
+          :ticket.note
+            ?<div>
+              <div style={{fontSize:13,color:COLORS.navy,lineHeight:1.6}}>{ticket.note}</div>
+              <div style={{fontSize:11,color:COLORS.slate,marginTop:4}}>— {ticket.noteBy} · {new Date(ticket.noteAt).toLocaleString()}</div>
+            </div>
+            :<div style={{fontSize:12,color:COLORS.slate,fontStyle:"italic"}}>{isOwner?"No note yet.":"No owner note yet."}</div>}
+      </div>
+
+      {/* Comments — all roles can add */}
+      <div style={{background:COLORS.surface,borderRadius:10,padding:"12px 14px",marginBottom:14}}>
+        <div style={{fontSize:12,fontWeight:700,color:COLORS.navy,marginBottom:10}}>💬 Comments ({comments.length})</div>
+        {comments.length>0&&<div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
+          {comments.map(c=>(
+            <div key={c.id} style={{background:COLORS.white,borderRadius:8,padding:"8px 12px",border:`1px solid ${COLORS.border}`}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+                <Avatar name={c.by} size={20}/>
+                <span style={{fontSize:12,fontWeight:700,color:COLORS.navy}}>{c.by}</span>
+                <span style={{fontSize:10,color:COLORS.slate}}>{new Date(c.at).toLocaleString()}</span>
+              </div>
+              <div style={{fontSize:13,color:COLORS.navy,lineHeight:1.5}}>{c.text}</div>
+            </div>
+          ))}
+        </div>}
+        <div style={{display:"flex",gap:8}}>
+          <input value={commentText} onChange={e=>setCommentText(e.target.value)}
+            onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();addComment(ticket.id);}}}
+            placeholder="Add a comment…"
+            style={{flex:1,padding:"8px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13,outline:"none"}}/>
+          <Btn small onClick={()=>addComment(ticket.id)} disabled={!commentText.trim()}>Post</Btn>
+        </div>
+      </div>
+
+      {/* Status actions — owners/managers only */}
+      {isOwner&&nextSt&&<Btn variant={nextSt==="resolved"?"green":"amber"} onClick={()=>updateStatus(ticket.id,nextSt)} style={{width:"100%",justifyContent:"center",marginBottom:8}}>
+        → Mark as {maintStatusCfg[nextSt].label}
+      </Btn>}
+      {ticket.status==="resolved"&&<div style={{textAlign:"center",fontSize:13,color:COLORS.green,fontWeight:600,padding:"8px 0"}}>
+        ✓ Resolved{ticket.resolvedAt?` on ${new Date(ticket.resolvedAt).toLocaleDateString()}`:""}
+      </div>}
+    </Modal>}
+
+    {/* Lightbox */}
+    {lightbox&&<div onClick={()=>setLightbox(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.93)",zIndex:300,display:"flex",alignItems:"center",justifyContent:"center",cursor:"zoom-out"}}>
+      <img src={lightbox} style={{maxWidth:"95vw",maxHeight:"88vh",objectFit:"contain",borderRadius:10}}/>
+      <button onClick={()=>setLightbox(null)} style={{position:"absolute",top:16,right:20,background:"none",border:"none",color:"#fff",fontSize:32,cursor:"pointer",lineHeight:1}}>×</button>
+    </div>}
+  </div>;
+}
+
+// ─── APP ──────────────────────────────────────────────────────────────────────
+// ─── FCM PUSH REGISTRATION ───────────────────────────────────────────────────
+// Replace VAPID_KEY_HERE with the key from:
+// Firebase Console → Project Settings → Cloud Messaging → Web configuration → Generate key pair
+const FCM_VAPID_KEY = "VAPID_KEY_HERE";
+
+async function registerFcmToken(accountId) {
+  try {
+    if (!("Notification" in window) || !navigator.serviceWorker) return;
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") return;
+    const reg = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+    const messaging = firebase.messaging();
+    const token = await messaging.getToken({ vapidKey: FCM_VAPID_KEY, serviceWorkerRegistration: reg });
+    if (token) await _db.ref(`accounts/${accountId}/fcmToken`).set(token);
+  } catch (e) { console.warn("FCM registration skipped:", e.message); }
+}
+
+function App() {
+  const db                     = _db;
+  const [currentUser, setUser] = useState(null);
+  const [authScreen, setAuth]  = useState("login");
+  const [sessChecked, setSessChecked] = useState(false);
+  const [tab, setTab]          = useState("dashboard");
+  const [section, setSection]  = useState("cleaning");
+
+  // Real-time data from Firebase
+  const [accounts,     setAccounts]   = useState([]);
+  const [properties,   setProps]      = useState([]);
+  const [jobs,         setJobs]       = useState([]);
+  const [stays,        setStays]      = useState([]);
+  const [inventory,    setInventory]  = useState([]);
+  const [maintenance,    setMaintenance]  = useState([]);
+  const [landscapeJobs,  setLandscape]    = useState([]);
+  const [garbageJobs,    setGarbage]      = useState([]);
+  const [toast,          setToast]        = useState(null);
+  const [online,       setOnline]     = useState(true);
+  const seenMaintIds = React.useRef(new Set());
+
+  // Monitor connection state
+  useEffect(() => {
+    const ref = db.ref(".info/connected");
+    ref.on("value", s => setOnline(s.val() === true));
+    return () => ref.off();
+  }, []);
+
+  // Setup real-time listeners
+  useEffect(() => {
+    const r = {
+      acc:   db.ref("accounts"),
+      props: db.ref("properties"),
+      jobs:  db.ref("jobs"),
+      stays: db.ref("stays"),
+      inv:   db.ref("inventory"),
+      maint:     db.ref("maintenance"),
+      landscape: db.ref("landscapeJobs"),
+      garbage:   db.ref("garbageJobs"),
+    };
+    r.acc.on("value",       s => setAccounts(objArr(s.val())));
+    r.landscape.on("value", s => setLandscape(objArr(s.val())));
+    r.garbage.on("value",   s => setGarbage(objArr(s.val())));
+    r.props.on("value",s => setProps(objArr(s.val())));
+    r.jobs.on("value", s => setJobs(objArr(s.val())));
+    r.stays.on("value",s => {
+      const v=s.val()||{}; const arr=[];
+      Object.values(v).forEach(p=>{ if(p) Object.values(p).forEach(st=>{ if(st) arr.push(st); }); });
+      setStays(arr);
+    });
+    r.inv.on("value",  s => {
+      const v=s.val()||{}; const arr=[];
+      Object.values(v).forEach(p=>{ if(p) Object.values(p).forEach(it=>{ if(it) arr.push(it); }); });
+      setInventory(arr);
+    });
+    r.maint.on("value",s => {
+      const arr = objArr(s.val());
+      setMaintenance(arr);
+      // Toast for owners: fire on new tickets not yet seen
+      const sess = loadSess();
+      if (!sess) return;
+      const newUrgent = arr.filter(t => !seenMaintIds.current.has(t.id) && t.urgency==="urgent" && t.status==="open");
+      const newAny    = arr.filter(t => !seenMaintIds.current.has(t.id) && t.status==="open");
+      arr.forEach(t => seenMaintIds.current.add(t.id));
+      if (newUrgent.length>0) {
+        setToast({msg:`🚨 Urgent: "${newUrgent[0].title}" — ${newUrgent[0].submittedBy}`,urgent:true});
+        setTimeout(()=>setToast(null),7000);
+      } else if (newAny.length>0) {
+        setToast({msg:`🔧 New maintenance request: "${newAny[0].title}"`,urgent:false});
+        setTimeout(()=>setToast(null),5000);
+      }
+    });
+    // Session restore
+    const sess = loadSess();
+    if (sess) {
+      r.acc.once("value", s => {
+        const user = objArr(s.val()).find(a=>a.id===sess.userId);
+        if (user) setUser(user);
+        setSessChecked(true);
+      });
+    } else setSessChecked(true);
+    return () => Object.values(r).forEach(ref=>ref.off());
+  }, [db]);
+
+  // Sync currentUser with live accounts (e.g. authorized status changed)
+  useEffect(() => {
+    if (!currentUser) return;
+    const live = accounts.find(a=>a.id===currentUser.id);
+    if (live) setUser(live);
+  }, [accounts]);
+
+  const handleLogin  = acc => {
+    saveSess({userId:acc.id}); setUser(acc);
+    setTab(["cleaner","landscaper","garbage"].includes(acc.role) ? "myjobs" : "dashboard");
+    if (["cleaner","landscaper","garbage"].includes(acc.role)) registerFcmToken(acc.id);
+  };
+  const handleLogout = () => { clearSess(); setUser(null); setAuth("login"); setTab("dashboard"); };
+
+  if (!sessChecked) return null;
+  if (!currentUser) {
+    return <DbCtx.Provider value={db}>
+      {authScreen==="login"
+        ?<LoginScreen onLogin={handleLogin} onGoSignup={()=>setAuth("signup")}/>
+        :<SignupScreen onSignup={handleLogin} onGoLogin={()=>setAuth("login")}/>}
+    </DbCtx.Provider>;
+  }
+  if (!currentUser.authorized) return <DbCtx.Provider value={db}><PendingScreen user={currentUser} onLogout={handleLogout}/></DbCtx.Provider>;
+
+  const isCleaner    = currentUser.role==="cleaner";
+  const isLandscaper = currentUser.role==="landscaper";
+  const isGarbage    = currentUser.role==="garbage";
+  const isWorker     = isCleaner || isLandscaper || isGarbage;
+  const isOwner      = currentUser.role==="owner";
+  const pendingCount = isOwner?accounts.filter(a=>!a.authorized&&a.role!=="owner").length:0;
+
+  const maintOpen = maintenance.filter(t=>t.status!=="resolved");
+  const maintBadge = isOwner ? maintOpen.length : maintenance.filter(t=>t.submittedById===currentUser.id&&t.status!=="resolved").length;
+  const urgentBadge = isOwner && maintOpen.some(t=>t.urgency==="urgent");
+
+  const myJobsBadge      = isCleaner    ? jobs.filter(j=>j.cleaner===currentUser.name&&j.status!=="complete").length : 0;
+  const landscapeBadge   = isLandscaper ? landscapeJobs.filter(j=>j.worker===currentUser.name&&j.status!=="complete").length : 0;
+  const garbageBadge     = isGarbage    ? garbageJobs.filter(j=>j.worker===currentUser.name&&j.status!=="complete").length : 0;
+
+  const changeSection = s => { setSection(s); setTab("dashboard"); };
+
+  const tabs = isLandscaper ? [
+    {id:"myjobs", label:"My Jobs", icon:"🌿", badge:landscapeBadge},
+  ] : isGarbage ? [
+    {id:"myjobs", label:"My Jobs", icon:"🗑", badge:garbageBadge},
+  ] : isCleaner ? [
+    {id:"myjobs",       label:"My Jobs",      icon:"🧹", badge:myJobsBadge},
+    {id:"calendar",     label:"Calendar",     icon:"📅"},
+    {id:"inventory",    label:"Inventory",    icon:"📦"},
+    {id:"maintenance",  label:"Maintenance",  icon:"🔧", badge:maintBadge},
+  ] : section==="landscape" ? [
+    {id:"dashboard",    label:"Dashboard",    icon:"🏠"},
+    {id:"landscape",    label:"Landscape",    icon:"🌿"},
+    ...(isOwner?[{id:"team",label:"Team",icon:"👥"}]:[]),
+  ] : section==="garbage" ? [
+    {id:"dashboard",    label:"Dashboard",    icon:"🏠"},
+    {id:"garbage",      label:"Garbage",      icon:"🗑"},
+    ...(isOwner?[{id:"team",label:"Team",icon:"👥"}]:[]),
+  ] : [
+    {id:"dashboard",    label:"Dashboard",    icon:"🏠"},
+    {id:"calendar",     label:"Calendar",     icon:"📅"},
+    {id:"sync",         label:"Sync",         icon:"🔄"},
+    {id:"jobs",         label:"Jobs",         icon:"🧹"},
+    {id:"maintenance",  label:"Maintenance",  icon:"🔧", badge:maintBadge, urgent:urgentBadge},
+    {id:"inventory",    label:"Inventory",    icon:"📦"},
+    ...(isOwner?[{id:"team",label:"Team",icon:"👥"}]:[]),
+  ];
+
+  return <DbCtx.Provider value={db}>
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Serif+Display&display=swap');
+      *{box-sizing:border-box;margin:0;padding:0;}
+      body{font-family:'DM Sans',sans-serif;background:#EEF2FF;}
+      @keyframes slideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+      @keyframes timerFlash{0%,100%{opacity:1}50%{opacity:0.25}}
+      .timer-flash{animation:timerFlash 1s infinite}
+      ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#CBD5E1;border-radius:3px}
+      .fc{font-family:'DM Sans',sans-serif!important}
+      .fc .fc-button-primary{background:#1B4FD8!important;border-color:#1B4FD8!important;font-family:'DM Sans',sans-serif!important;font-weight:600!important;font-size:12px!important;border-radius:8px!important;padding:6px 14px!important;text-transform:none!important;letter-spacing:0!important}
+      .fc .fc-button-primary:not(:disabled):hover{background:#1539b8!important;border-color:#1539b8!important}
+      .fc .fc-button-primary:not(:disabled).fc-button-active,.fc .fc-button-primary:not(:disabled).fc-button-active:hover{background:#0A1628!important;border-color:#0A1628!important}
+      .fc .fc-button-primary:disabled{background:#94A3B8!important;border-color:#94A3B8!important}
+      .fc .fc-toolbar-title{font-family:'DM Serif Display',serif!important;font-size:20px!important;color:#0A1628!important;font-weight:400!important}
+      .fc .fc-col-header-cell-cushion{font-size:11px!important;font-weight:700!important;color:#64748B!important;text-decoration:none!important;text-transform:uppercase!important;letter-spacing:.6px!important}
+      .fc .fc-daygrid-day-number{font-size:12px!important;color:#0A1628!important;font-weight:600!important;text-decoration:none!important;padding:4px 6px!important}
+      .fc .fc-day-today{background:#EEF2FF!important}
+      .fc .fc-event{border-radius:5px!important;cursor:pointer!important;border:none!important}
+      .fc .fc-event:hover{filter:brightness(1.12)!important}
+      .fc-ev-turnover{border-left:3px solid #F97316!important;padding-left:1px!important}
+      .fc .fc-more-link{font-size:11px!important;color:#1B4FD8!important;font-weight:600!important;text-decoration:none!important}
+      .fc td,.fc th{border-color:#E2E8F0!important}
+      .fc .fc-scrollgrid{border-color:#E2E8F0!important}
+      .fc .fc-list-event:hover td{background:#EEF2FF!important;cursor:pointer!important}
+      .fc .fc-list-day-cushion{background:#F8FAFF!important;font-weight:700!important;font-size:12px!important}
+      .fc .fc-daygrid-event-harness{margin-bottom:2px!important}
+      .fc .fc-list-event-dot{border-color:inherit!important}
+      @media(max-width:640px){.fc .fc-toolbar{flex-wrap:wrap;gap:6px}.fc .fc-toolbar-title{font-size:15px!important}.fc .fc-button-primary{font-size:11px!important;padding:5px 9px!important}}
+    `}</style>
+
+    <div style={{minHeight:"100vh",background:"#EEF2FF",fontFamily:FONT}}>
+      {/* Nav */}
+      <div style={{background:COLORS.white,borderBottom:`1px solid ${COLORS.border}`,padding:"0 24px",display:"flex",alignItems:"center",justifyContent:"space-between",height:60,position:"sticky",top:0,zIndex:50,boxShadow:"0 1px 8px rgba(0,0,0,0.05)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <div style={{width:32,height:32,borderRadius:9,background:COLORS.navy,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <span style={{color:"#fff",fontSize:14,fontWeight:800}}>B</span>
+          </div>
+          <div>
+            <div style={{fontWeight:800,fontSize:14,color:COLORS.navy,fontFamily:DISPLAY}}>Bluerock</div>
+            <div style={{fontSize:10,color:COLORS.slate,marginTop:-2}}>Property Management</div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          <div style={{width:8,height:8,borderRadius:"50%",background:online?COLORS.green:"#F59E0B"}} title={online?"Real-time sync active":"Offline — changes will sync when reconnected"}/>
+          {isOwner&&pendingCount>0&&<div onClick={()=>setTab("team")} title={`${pendingCount} pending`} style={{width:22,height:22,borderRadius:"50%",background:COLORS.red,color:"#fff",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer"}}>{pendingCount}</div>}
+          <Avatar name={currentUser.name} size={30}/>
+          <div style={{lineHeight:1.2}}>
+            <div style={{fontSize:12,fontWeight:700,color:COLORS.navy}}>{currentUser.name}</div>
+            <div style={{fontSize:10,color:COLORS.slate,textTransform:"capitalize"}}>{currentUser.role==="owner"?"Owner":currentUser.role==="manager"?"Manager":currentUser.role==="landscaper"?"Landscaper":currentUser.role==="garbage"?"Garbage Collector":"Cleaner"}</div>
+          </div>
+          <button onClick={handleLogout} style={{background:"none",border:`1.5px solid ${COLORS.border}`,borderRadius:8,padding:"5px 12px",cursor:"pointer",fontFamily:FONT,fontSize:12,color:COLORS.slate,fontWeight:600}}>Sign out</button>
+        </div>
+      </div>
+
+      {/* Offline banner */}
+      {!online&&<div style={{background:"#92400E",color:"#fff",textAlign:"center",padding:"8px 16px",fontSize:13,fontWeight:600}}>
+        📡 No internet connection — your changes are saved and will sync automatically when you're back online.
+      </div>}
+
+      {/* Toast notification */}
+      {toast&&isOwner&&<div style={{position:"fixed",top:68,left:"50%",transform:"translateX(-50%)",zIndex:99,background:toast.urgent?"#991B1B":COLORS.navy,color:"#fff",padding:"12px 20px",borderRadius:12,fontSize:13,fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,0.25)",display:"flex",alignItems:"center",gap:12,maxWidth:460,width:"calc(100% - 40px)",animation:"slideUp 0.2s ease"}}>
+        <span style={{flex:1}}>{toast.msg}</span>
+        <button onClick={()=>setToast(null)} style={{background:"none",border:"none",color:"rgba(255,255,255,0.7)",cursor:"pointer",fontSize:18,lineHeight:1,padding:0}}>×</button>
+      </div>}
+
+      {/* Content */}
+      <div style={{maxWidth:tab==="calendar"?1100:860,margin:"0 auto",padding:"24px 20px"}}>
+        {!isWorker&&<div style={{display:"flex",gap:6,marginBottom:16,background:COLORS.white,padding:"6px 8px",borderRadius:14,border:`1px solid ${COLORS.border}`,width:"fit-content",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+          {[
+            {id:"cleaning",  label:"Cleaning",    icon:"🧹"},
+            {id:"landscape", label:"Landscaping", icon:"🌿"},
+            {id:"garbage",   label:"Garbage",     icon:"🗑"},
+          ].map(s=>(
+            <button key={s.id} onClick={()=>changeSection(s.id)} style={{
+              padding:"7px 18px",borderRadius:9,border:"none",cursor:"pointer",
+              fontFamily:FONT,fontSize:13,fontWeight:600,transition:"all 0.15s",
+              background:section===s.id?COLORS.navy:"transparent",
+              color:section===s.id?"#fff":COLORS.slate,
+            }}>{s.icon} {s.label}</button>
+          ))}
+        </div>}
+        <Tabs tabs={tabs} active={tab} onChange={setTab}/>
+        {tab==="myjobs"     &&isCleaner   &&<MyJobsView jobs={jobs} properties={properties} currentUser={currentUser}/>}
+        {tab==="myjobs"     &&isLandscaper&&<WorkerScheduleView jobs={landscapeJobs.filter(j=>j.worker===currentUser.name)} jobType="landscape" currentUser={currentUser} properties={properties}/>}
+        {tab==="myjobs"     &&isGarbage   &&<WorkerScheduleView jobs={garbageJobs.filter(j=>j.worker===currentUser.name)} jobType="garbage" currentUser={currentUser} properties={properties}/>}
+        {tab==="dashboard"  &&!isWorker&&<DashboardView jobs={jobs} inventory={inventory} properties={properties} currentUser={currentUser} stays={stays} maintenance={maintenance}/>}
+        {tab==="calendar"  &&<OpsCalendarView stays={stays} properties={properties} jobs={jobs} currentUser={currentUser} accounts={accounts}/>}
+        {tab==="sync"      &&!isWorker&&<CalendarView stays={stays} jobs={jobs} properties={properties} accounts={accounts} currentUser={currentUser} readOnly={false}/>}
+        {tab==="jobs"      &&!isWorker&&<JobsView jobs={jobs} properties={properties} accounts={accounts} currentUser={currentUser}/>}
+        {tab==="landscape"  &&!isWorker&&<ScheduleManagerView jobs={landscapeJobs} jobType="landscape" accounts={accounts} properties={properties} currentUser={currentUser}/>}
+        {tab==="garbage"    &&!isWorker&&<ScheduleManagerView jobs={garbageJobs} jobType="garbage" accounts={accounts} properties={properties} currentUser={currentUser}/>}
+        {tab==="maintenance"&&<MaintenanceView maintenance={maintenance} properties={properties} currentUser={currentUser}/>}
+        {tab==="inventory"  &&<InventoryView inventory={inventory} properties={properties} currentUser={currentUser}/>}
+        {tab==="team"       &&isOwner&&<TeamView currentUser={currentUser} accounts={accounts} section={section}/>}
+      </div>
+    </div>
+  </DbCtx.Provider>;
+}
+
+// ─── JOBS VIEW ────────────────────────────────────────────────────────────────
+function JobsView({jobs,properties,accounts,currentUser}) {
+  const db = useContext(DbCtx);
+  const [filter,setFilter]=useState("all");
+  const [showModal,setShowModal]=useState(null);
+  const [showNew,setShowNew]=useState(false);
+  const [newJob,setNewJob]=useState({propertyId:"",checkoutDate:"",checkinDate:"",cleaner:""});
+  const cleaners = accounts.filter(a=>a.authorized&&(a.role==="cleaner"||a.role==="manager"||a.role==="owner")).map(a=>a.name);
+  const filtered = filter==="all"?jobs:jobs.filter(j=>j.status===filter);
+  const sorted = filtered.slice().sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate));
+
+  const updateStatus = async (jobId,newStatus) => {
+    const now = new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+    if (newStatus==="in-progress") await db.ref(`jobs/${jobId}`).update({status:"in-progress",arrivedAt:now});
+    if (newStatus==="complete")    await db.ref(`jobs/${jobId}`).update({status:"complete",completedAt:now});
+    setShowModal(null);
+  };
+  const assignCleaner = async (jobId,cleaner) => {
+    await db.ref(`jobs/${jobId}`).update({cleaner:cleaner||null});
+  };
+  const addJob = async () => {
+    if (!newJob.propertyId||!newJob.checkoutDate) return;
+    const id = String(Date.now());
+    await db.ref(`jobs/${id}`).set({id,propertyId:newJob.propertyId,checkoutDate:newJob.checkoutDate,checkinDate:newJob.checkinDate||null,status:"pending",cleaner:newJob.cleaner||null,arrivedAt:null,completedAt:null,photos:0});
+    setShowNew(false); setNewJob({propertyId:"",checkoutDate:"",checkinDate:"",cleaner:""});
+  };
+
+  return <div>
+    <div style={{display:"flex",gap:8,marginBottom:20,flexWrap:"wrap",alignItems:"center"}}>
+      {["all","pending","in-progress","complete"].map(f=>(
+        <button key={f} onClick={()=>setFilter(f)} style={{padding:"6px 14px",borderRadius:20,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:12,fontWeight:600,background:filter===f?COLORS.blue:COLORS.sky,color:filter===f?"#fff":COLORS.slate}}>
+          {f==="all"?"All":jobStatusCfg[f].label}
+        </button>
+      ))}
+      <div style={{flex:1}}/>
+      {properties.length>0&&<Btn small onClick={()=>setShowNew(true)}>+ New Job</Btn>}
+    </div>
+
+    {sorted.length===0?<div style={{textAlign:"center",padding:"40px 0",color:COLORS.slate,fontSize:14}}>
+      {jobs.length===0?"No jobs yet. Sync an iCal in the Calendar tab.":"No jobs in this category."}
+    </div>:<div style={{display:"flex",flexDirection:"column",gap:12}}>
+      {sorted.map(job=>{
+        const prop=getProp(job.propertyId,properties);
+        return <Card key={job.id} onClick={()=>setShowModal(job)} style={{padding:"16px 20px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:14}}>
+            <div style={{width:4,height:56,borderRadius:4,background:prop.color,flexShrink:0}}/>
+            <div style={{flex:1}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                <span style={{fontWeight:700,fontSize:15,color:COLORS.navy}}>{prop.name}</span>
+                <Badge config={jobStatusCfg[job.status]} small/>
+                {!job.cleaner&&<span style={{fontSize:11,color:COLORS.amber,fontWeight:600}}>Unassigned</span>}
+              </div>
+              <div style={{fontSize:12,color:COLORS.slate,marginBottom:3}}>Checkout: {fmtDate(job.checkoutDate)}{job.checkinDate?` → Check-in: ${fmtDate(job.checkinDate)}`:""}</div>
+              <div style={{fontSize:12,color:COLORS.slate,display:"flex",gap:12}}>
+                {job.cleaner&&<span>👤 {job.cleaner}</span>}
+                {job.arrivedAt&&<span>🕐 Arrived {job.arrivedAt}</span>}
+                {job.completedAt&&<span>✓ Done {job.completedAt}</span>}
+              </div>
+            </div>
+            <span style={{color:COLORS.slate,fontSize:18}}>›</span>
+          </div>
+        </Card>;
+      })}
+    </div>}
+
+    {showModal&&<Modal onClose={()=>setShowModal(null)}>
+      <div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
+          <div style={{width:14,height:14,borderRadius:"50%",background:getProp(showModal.propertyId,properties).color}}/>
+          <h3 style={{fontFamily:DISPLAY,fontSize:20,color:COLORS.navy,margin:0}}>{getProp(showModal.propertyId,properties).name}</h3>
+          <Badge config={jobStatusCfg[showModal.status]}/>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+          {[["Checkout",fmtDate(showModal.checkoutDate)],["Check-in",showModal.checkinDate?fmtDate(showModal.checkinDate):"TBD"],["Arrived",showModal.arrivedAt||"—"],["Completed",showModal.completedAt||"—"]].map(([l,v])=>(
+            <div key={l} style={{background:COLORS.surface,borderRadius:10,padding:"10px 14px"}}>
+              <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>{l}</div>
+              <div style={{fontSize:13,fontWeight:600,color:COLORS.navy}}>{v}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{background:COLORS.surface,borderRadius:10,padding:"10px 14px",marginBottom:14}}>
+          <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>Assigned Cleaner</div>
+          <div style={{fontSize:13,fontWeight:600,color:showModal.cleaner?COLORS.navy:COLORS.slate}}>{showModal.cleaner||"Unassigned — waiting for a cleaner to claim"}</div>
+        </div>
+        {showModal.status==="pending"&&<Btn variant="amber" onClick={()=>updateStatus(showModal.id,"in-progress")} style={{width:"100%",justifyContent:"center",marginBottom:8}}>🕐 Mark In Progress</Btn>}
+        {showModal.status==="in-progress"&&<Btn variant="green" onClick={()=>updateStatus(showModal.id,"complete")} style={{width:"100%",justifyContent:"center",marginBottom:8}}>✓ Mark Complete</Btn>}
+      </div>
+    </Modal>}
+
+    {showNew&&<Modal onClose={()=>setShowNew(false)}>
+      <h3 style={{fontFamily:DISPLAY,fontSize:20,color:COLORS.navy,marginBottom:20}}>Create New Job</h3>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {[{l:"Property",f:"propertyId",type:"select",opts:properties.map(p=>({v:p.id,l:p.name}))},{l:"Checkout Date",f:"checkoutDate",type:"date"},{l:"Check-in Date (optional)",f:"checkinDate",type:"date"}].map(({l,f,type,opts})=>(
+          <div key={f}>
+            <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>{l}</label>
+            {type==="select"
+              ?<select value={newJob[f]} onChange={e=>setNewJob(p=>({...p,[f]:e.target.value}))} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+                <option value="">Select…</option>
+                {(opts||[]).map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
+              </select>
+              :<input type={type} value={newJob[f]} onChange={e=>setNewJob(p=>({...p,[f]:e.target.value}))} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13,boxSizing:"border-box"}}/>}
+          </div>
+        ))}
+      </div>
+      <div style={{display:"flex",gap:10,marginTop:20}}>
+        <Btn onClick={addJob} disabled={!newJob.propertyId||!newJob.checkoutDate}>Create Job</Btn>
+        <Btn variant="ghost" onClick={()=>setShowNew(false)}>Cancel</Btn>
+      </div>
+    </Modal>}
+  </div>;
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App/>);
+</script>
+</body>
+</html>
