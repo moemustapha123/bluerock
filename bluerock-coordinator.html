@@ -956,10 +956,10 @@ function DashboardView({jobs,inventory,properties,currentUser,stays,maintenance}
       </div>
     </Card>}
 
-    {jobs.length>0&&<>
-      <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,marginBottom:14,fontFamily:DISPLAY}}>Recent Jobs</h3>
+    {jobs.length>0&&(()=>{const upcomingJobs=jobs.filter(j=>j.status!=="complete"&&j.checkoutDate>=todayStr).sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate)).slice(0,8);return upcomingJobs.length>0&&<>
+      <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,marginBottom:14,fontFamily:DISPLAY}}>Upcoming Jobs</h3>
       <div style={{display:"flex",flexDirection:"column",gap:10}}>
-        {jobs.slice().sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate)).slice(0,6).map(job=>{
+        {upcomingJobs.map(job=>{
           const prop=getProp(job.propertyId,properties);
           return <Card key={job.id} style={{padding:"14px 18px"}}>
             <div style={{display:"flex",alignItems:"center",gap:12}}>
@@ -978,7 +978,7 @@ function DashboardView({jobs,inventory,properties,currentUser,stays,maintenance}
           </Card>;
         })}
       </div>
-    </>}
+    </>})()}
   </div>;
 }
 
