@@ -957,3 +957,105 @@ exports.dailyReminders = functions.pubsub.schedule("0 7 * * *")
       }
     }
   });
+
+// ─── AUTO iCAL SYNC (every 30 minutes) ───────────────────────────────────────
+
+function parseIcalText(text) {
+  const events = [];
+  const re = /BEGIN:VEVENT([\s\S]*?)END:VEVENT/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const b = m[1];
+    const ds = b.match(/DTSTART(?:;[^\r\n:]*)?:(\d{8})/)?.[1];
+    const de = b.match(/DTEND(?:;[^\r\n:]*)?:(\d{8})/)?.[1];
+    const uid = b.match(/UID:([^\r\n]+)/)?.[1]?.trim();
+    if (ds && de) {
+      const fmt = d => `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
+      const start = fmt(ds), end = fmt(de);
+      const nights = Math.round((new Date(end) - new Date(start)) / 86400000);
+      events.push({ start, end, nights, uid: uid || `${ds}_${de}` });
+    }
+  }
+  return events.sort((a, b) => a.start.localeCompare(b.start));
+}
+
+const icalSafeKey = s => String(s).replace(/[.#$[\]/]/g, "_").slice(0, 200);
+
+function icalWindowTime(dateStr, timeStr) {
+  if (!dateStr || !timeStr) return null;
+  const m = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!m) return null;
+  let h = parseInt(m[1]), min = parseInt(m[2]);
+  const ampm = m[3].toUpperCase();
+  if (ampm === "PM" && h !== 12) h += 12;
+  if (ampm === "AM" && h === 12) h = 0;
+  const [y, mo, d] = dateStr.split("-").map(Number);
+  return new Date(y, mo - 1, d, h, min, 0).getTime();
+}
+
+async function fetchIcalDirect(url) {
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; CalendarSync/1.0)" } });
+    if (r.ok) {
+      const t = await r.text();
+      if (t.includes("BEGIN:VCALENDAR")) return t;
+    }
+  } catch (e) {
+    console.warn(`[autoSyncIcal] Direct fetch failed: ${e.message}`);
+  }
+  return null;
+}
+
+exports.autoSyncIcal = functions.pubsub.schedule("*/30 * * * *")
+  .timeZone("America/Toronto")
+  .onRun(async () => {
+    const propsSnap = await db.ref("properties").once("value");
+    const properties = Object.values(propsSnap.val() || {});
+    console.log(`[autoSyncIcal] Checking ${properties.length} properties`);
+
+    for (const prop of properties) {
+      if (!prop.icalUrl || !prop.id) continue;
+      try {
+        const text = await fetchIcalDirect(prop.icalUrl);
+        if (!text) {
+          console.warn(`[autoSyncIcal] Could not fetch iCal for ${prop.name} (${prop.id})`);
+          continue;
+        }
+        const events = parseIcalText(text);
+        if (events.length === 0) {
+          console.log(`[autoSyncIcal] No events in iCal for ${prop.name}`);
+          continue;
+        }
+
+        const staysRef = db.ref(`stays/${prop.id}`);
+        const sorted = events.slice().sort((a, b) => a.start.localeCompare(b.start));
+        let added = 0;
+
+        for (const ev of events) {
+          const k = icalSafeKey(ev.uid);
+          await staysRef.child(k).set({ uid: ev.uid, start: ev.start, end: ev.end, nights: ev.nights, propId: prop.id });
+
+          const jobId = `ical_${prop.id}_${k}`;
+          const existingJob = await db.ref(`jobs/${jobId}`).once("value");
+          if (!existingJob.val()) {
+            const idx = sorted.findIndex(e => e.uid === ev.uid);
+            const nextCheckin = sorted[idx + 1]?.start || null;
+            const wStart = icalWindowTime(ev.end, prop.checkoutTime || "11:00 AM");
+            const wEnd   = icalWindowTime(nextCheckin, prop.checkinTime || "3:00 PM");
+            await db.ref(`jobs/${jobId}`).set({
+              id: jobId, propertyId: prop.id, checkoutDate: ev.end, checkinDate: nextCheckin,
+              status: "pending", cleaner: null, arrivedAt: null, completedAt: null,
+              photos: 0, windowStart: wStart || null, windowEnd: wEnd || null,
+              overdueAlertSent: false, createdAt: new Date().toISOString(),
+            });
+            added++;
+          }
+        }
+
+        await db.ref(`properties/${prop.id}`).update({ lastSynced: new Date().toISOString() });
+        console.log(`[autoSyncIcal] ${prop.name} — ${events.length} bookings, ${added} new job(s)`);
+      } catch (e) {
+        console.error(`[autoSyncIcal] Error syncing ${prop.name}:`, e.message);
+      }
+    }
+  });

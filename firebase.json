@@ -1,4 +1,9 @@
 {
+  "hosting": {
+    "public": ".",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**", "functions/**", "database.rules.json", "SETUP-EMAIL-NOTIFICATIONS.md", "bluerock-coordinator.jsx"],
+    "rewrites": []
+  },
   "functions": {
     "source": "functions",
     "runtime": "nodejs22",
