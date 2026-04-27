@@ -75,6 +75,10 @@ function parseIcal(text) {
   const events = []; const re = /BEGIN:VEVENT([\s\S]*?)END:VEVENT/g; let m;
   while ((m = re.exec(text)) !== null) {
     const b = m[1];
+    const summary = (b.match(/SUMMARY:([^\r\n]+)/)?.[1] || "").trim();
+    // Skip "Not available" / "Blocked" / "Unavailable" entries — these are calendar
+    // blocks, not real guest bookings, and would create phantom duplicate cleaning jobs
+    if (/not available|blocked|unavailable/i.test(summary)) continue;
     const ds = b.match(/DTSTART(?:;[^\r\n:]*)?:(\d{8})/)?.[1];
     const de = b.match(/DTEND(?:;[^\r\n:]*)?:(\d{8})/)?.[1];
     const uid = b.match(/UID:([^\r\n]+)/)?.[1]?.trim();
@@ -222,7 +226,7 @@ function Btn({children,variant="primary",onClick,small,disabled,style:s}) {
 }
 function Modal({children,onClose,wide}) {
   return <div style={{position:"fixed",inset:0,background:"rgba(10,22,40,0.55)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:20}} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
-    <div style={{background:COLORS.white,borderRadius:20,padding:28,width:"100%",maxWidth:wide?700:520,maxHeight:"88vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.25)",animation:"slideUp 0.18s ease"}}>
+    <div className="br-modal-inner" style={{background:COLORS.white,borderRadius:20,padding:28,width:"100%",maxWidth:wide?700:520,maxHeight:"88vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.25)",animation:"slideUp 0.18s ease"}}>
       <div style={{display:"flex",justifyContent:"flex-end",marginBottom:4}}>
         <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",fontSize:22,color:COLORS.slate,lineHeight:1}}>×</button>
       </div>
@@ -239,8 +243,8 @@ function FieldInput({label,type="text",value,onChange,placeholder,onKeyDown}) {
 }
 function ErrBox({msg}) { return msg?<div style={{background:"#FEE2E2",color:"#991B1B",padding:"10px 14px",borderRadius:8,fontSize:13,marginBottom:14}}>{msg}</div>:null; }
 function Tabs({tabs,active,onChange}) {
-  return <div style={{display:"flex",gap:4,background:COLORS.sky,padding:4,borderRadius:12,marginBottom:24}}>
-    {tabs.map(t=><button key={t.id} onClick={()=>onChange(t.id)} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",cursor:"pointer",fontFamily:FONT,fontWeight:600,fontSize:13,background:active===t.id?COLORS.white:"transparent",color:active===t.id?COLORS.blue:COLORS.slate,boxShadow:active===t.id?"0 1px 4px rgba(0,0,0,0.08)":"none",transition:"all 0.15s",display:"flex",alignItems:"center",justifyContent:"center",gap:5,position:"relative"}}>
+  return <div className="br-tabs-wrap" style={{display:"flex",gap:4,background:COLORS.sky,padding:4,borderRadius:12,marginBottom:24}}>
+    {tabs.map(t=><button key={t.id} className="br-tab-btn" onClick={()=>onChange(t.id)} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",cursor:"pointer",fontFamily:FONT,fontWeight:600,fontSize:13,background:active===t.id?COLORS.white:"transparent",color:active===t.id?COLORS.blue:COLORS.slate,boxShadow:active===t.id?"0 1px 4px rgba(0,0,0,0.08)":"none",transition:"all 0.15s",display:"flex",alignItems:"center",justifyContent:"center",gap:5,position:"relative"}}>
       <span>{t.icon}</span>{t.label}
       {t.badge>0&&<span style={{background:t.urgent?COLORS.red:COLORS.amber,color:"#fff",fontSize:10,fontWeight:700,padding:"1px 5px",borderRadius:20,minWidth:16,textAlign:"center"}}>{t.badge}</span>}
     </button>)}
@@ -377,14 +381,16 @@ function TeamView({currentUser,accounts,section="cleaning"}) {
   const roleLabel  = r=>r==="manager"?"Owner / Manager":r==="landscaper"?"Landscaper":r==="garbage"?"Garbage Collector":r.charAt(0).toUpperCase()+r.slice(1);
   const MemberCard = ({u,children})=>(
     <Card style={{padding:"14px 18px"}}>
-      <div style={{display:"flex",alignItems:"center",gap:12}}>
+      <div className="br-member-row" style={{display:"flex",alignItems:"center",gap:12}}>
         <Avatar name={u.name} size={38}/>
-        <div style={{flex:1}}>
-          <div style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{u.name}</div>
-          <div style={{fontSize:12,color:COLORS.slate}}>{u.email}</div>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontWeight:700,fontSize:14,color:COLORS.navy,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{u.name}</div>
+          <div style={{fontSize:12,color:COLORS.slate,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{u.email}</div>
           <div style={{fontSize:11,color:COLORS.slate,marginTop:2}}>{roleLabel(u.role)}</div>
         </div>
-        {children}
+        <div className="br-member-actions" style={{display:"flex",gap:6,flexShrink:0,alignItems:"center"}}>
+          {children}
+        </div>
       </div>
     </Card>
   );
@@ -507,7 +513,7 @@ function CalendarView({stays,jobs,properties,accounts,currentUser,readOnly}) {
 
   return <div>
     {!readOnly&&<AddPropertyModal open={addOpen} onClose={()=>setAddOpen(false)} properties={properties} onSync={doSync}/>}
-    {editProp&&<EditPropertyModal prop={editProp} onClose={()=>setEditProp(null)}/>}
+    {editProp&&<EditPropertyModal prop={editProp} accounts={accounts} onClose={()=>setEditProp(null)}/>}
 
     {!readOnly&&<div style={{marginBottom:24}}>
       <Btn onClick={()=>setAddOpen(true)}>➕ Add Property</Btn>
@@ -773,12 +779,14 @@ function AddPropertyModal({open,onClose,properties,onSync}) {
   </Modal>;
 }
 
-function EditPropertyModal({prop,onClose}) {
+function EditPropertyModal({prop,accounts,onClose}) {
   const db = useContext(DbCtx);
   const [name,setName]=useState(prop.name); const [url,setUrl]=useState(prop.icalUrl||"");
   const [addr,setAddr]=useState(prop.address||""); const [checkinTime,setCheckinTime]=useState(prop.checkinTime||"3:00 PM"); const [checkoutTime,setCheckoutTime]=useState(prop.checkoutTime||"11:00 AM");
+  const [garbageWorker,setGarbageWorker]=useState(prop.garbageWorker||"");
+  const garbageCollectors=(accounts||[]).filter(a=>a.authorized&&a.role==="garbage").map(a=>a.name);
   const save = async () => {
-    await db.ref(`properties/${prop.id}`).update({name:name.trim(),icalUrl:url.trim(),address:addr.trim(),checkinTime,checkoutTime});
+    await db.ref(`properties/${prop.id}`).update({name:name.trim(),icalUrl:url.trim(),address:addr.trim(),checkinTime,checkoutTime,garbageWorker:garbageWorker||null});
     onClose();
   };
   return <Modal onClose={onClose}>
@@ -800,6 +808,14 @@ function EditPropertyModal({prop,onClose}) {
             {CHECK_TIMES.map(t=><option key={t} value={t}>{t}</option>)}
           </select>
         </div>
+      </div>
+      <div>
+        <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>🗑 Garbage Collector</label>
+        <select value={garbageWorker} onChange={e=>setGarbageWorker(e.target.value)} style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${COLORS.border}`,fontFamily:FONT,fontSize:13}}>
+          <option value="">None (no auto-scheduling)</option>
+          {garbageCollectors.map(w=><option key={w} value={w}>{w}</option>)}
+        </select>
+        <div style={{fontSize:11,color:COLORS.slate,marginTop:4}}>Used for automatic weekly garbage job scheduling.</div>
       </div>
     </div>
     <div style={{display:"flex",gap:10,marginTop:20}}>
@@ -886,11 +902,13 @@ function DashboardView({jobs,inventory,properties,currentUser,stays,maintenance}
   const inProgress=jobs.filter(j=>j.status==="in-progress").length;
   const pending=jobs.filter(j=>j.status==="pending").length;
   const needsRestock=inventory.filter(i=>i.status==="pending").length;
-  const todayStr = today();
+  // Use LOCAL date (not UTC) so the filter is always correct regardless of time of day
+  const d0=new Date();
+  const todayStr=d0.getFullYear()+"-"+String(d0.getMonth()+1).padStart(2,"0")+"-"+String(d0.getDate()).padStart(2,"0");
   const activeStays=stays.filter(s=>s.start<=todayStr&&s.end>todayStr);
 
   return <div>
-    <div style={{background:`linear-gradient(135deg,${COLORS.navy} 0%,#1B3A6B 100%)`,borderRadius:20,padding:"28px 32px",marginBottom:24,display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:20}}>
+    <div className="br-hero" style={{background:`linear-gradient(135deg,${COLORS.navy} 0%,#1B3A6B 100%)`,borderRadius:20,padding:"28px 32px",marginBottom:24,display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:20}}>
       <div>
         <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,marginBottom:4}}>{new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"})}</div>
         <div style={{color:"#fff",fontSize:22,fontWeight:700,fontFamily:DISPLAY}}>Good morning, {currentUser.name} 👋</div>
@@ -898,10 +916,10 @@ function DashboardView({jobs,inventory,properties,currentUser,stays,maintenance}
           {activeStays.length>0?`${activeStays.length} active stay${activeStays.length>1?"s":""} right now`:inProgress>0?`${inProgress} clean${inProgress>1?"s":""} in progress`:"No active cleans at the moment"}
         </div>
       </div>
-      <div style={{display:"flex",gap:28}}>
+      <div className="br-hero-stats" style={{display:"flex",gap:28,flexWrap:"wrap"}}>
         {[["Total Jobs",jobs.length,"#fff"],["Complete",complete,COLORS.green],["In Progress",inProgress,"#60A5FA"],["Pending",pending,COLORS.amber]].map(([l,v,c])=>(
           <div key={l} style={{textAlign:"center"}}>
-            <div style={{fontSize:28,fontWeight:700,color:c,fontFamily:DISPLAY}}>{v}</div>
+            <div className="br-hero-stat-num" style={{fontSize:28,fontWeight:700,color:c,fontFamily:DISPLAY}}>{v}</div>
             <div style={{fontSize:12,color:"rgba(255,255,255,0.6)",marginTop:2}}>{l}</div>
           </div>
         ))}
@@ -956,29 +974,44 @@ function DashboardView({jobs,inventory,properties,currentUser,stays,maintenance}
       </div>
     </Card>}
 
-    {jobs.length>0&&(()=>{const upcomingJobs=jobs.filter(j=>j.status!=="complete"&&j.checkoutDate>=todayStr).sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate)).slice(0,8);return upcomingJobs.length>0&&<>
-      <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,marginBottom:14,fontFamily:DISPLAY}}>Upcoming Jobs</h3>
-      <div style={{display:"flex",flexDirection:"column",gap:10}}>
-        {upcomingJobs.map(job=>{
-          const prop=getProp(job.propertyId,properties);
-          return <Card key={job.id} style={{padding:"14px 18px"}}>
-            <div style={{display:"flex",alignItems:"center",gap:12}}>
-              <div style={{width:8,height:40,borderRadius:4,background:prop.color,flexShrink:0}}/>
-              <div style={{flex:1}}>
-                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
-                  <span style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{prop.name}</span>
-                  <Badge config={jobStatusCfg[job.status]} small/>
-                  {!job.cleaner&&<span style={{fontSize:11,color:COLORS.amber,fontWeight:600}}>Unassigned</span>}
-                </div>
-                <div style={{fontSize:12,color:COLORS.slate}}>
-                  Checkout: {fmtDate(job.checkoutDate)}{job.checkinDate?` → Check-in: ${fmtDate(job.checkinDate)}`:""} {job.cleaner?`· ${job.cleaner}`:""}
+    {(()=>{
+      const d1=new Date(d0); d1.setDate(d1.getDate()+1);
+      const tomorrowStr=d1.getFullYear()+"-"+String(d1.getMonth()+1).padStart(2,"0")+"-"+String(d1.getDate()).padStart(2,"0");
+      const upcomingJobs=(()=>{
+        const s=jobs.filter(j=>j.status!=="complete"&&j.checkoutDate&&j.checkoutDate>=todayStr)
+          .sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate)||(b.cleaner?1:0)-(a.cleaner?1:0));
+        const seen=new Set();
+        return s.filter(j=>{const k=`${j.propertyId}_${j.checkoutDate}`;if(seen.has(k))return false;seen.add(k);return true;});
+      })().slice(0,10);
+      if(!upcomingJobs.length) return null;
+      const dayLabel=dt=>dt===todayStr?"Today":dt===tomorrowStr?"Tomorrow":null;
+      return <>
+        <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,marginBottom:14,fontFamily:DISPLAY}}>Upcoming Jobs</h3>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {upcomingJobs.map(job=>{
+            const prop=getProp(job.propertyId,properties);
+            const label=dayLabel(job.checkoutDate);
+            return <Card key={job.id} style={{padding:"14px 18px"}}>
+              <div style={{display:"flex",alignItems:"center",gap:12}}>
+                <div style={{width:8,borderRadius:4,background:prop.color,flexShrink:0,alignSelf:"stretch"}}/>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                    <span style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{prop.name}</span>
+                    <Badge config={jobStatusCfg[job.status]} small/>
+                    {!job.cleaner&&<span style={{fontSize:11,color:COLORS.amber,fontWeight:600}}>Unassigned</span>}
+                    {label&&<span style={{fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:20,background:label==="Today"?"#FEE2E2":"#DBEAFE",color:label==="Today"?"#991B1B":"#1D4ED8"}}>{label}</span>}
+                  </div>
+                  <div style={{fontSize:13,fontWeight:600,color:COLORS.navy,marginBottom:2}}>
+                    Checkout: {fmtDateLong(job.checkoutDate)}
+                  </div>
+                  {job.cleaner&&<div style={{fontSize:12,color:COLORS.slate,marginTop:2}}>👤 {job.cleaner}</div>}
                 </div>
               </div>
-            </div>
-          </Card>;
-        })}
-      </div>
-    </>})()}
+            </Card>;
+          })}
+        </div>
+      </>;
+    })()}
   </div>;
 }
 
@@ -1680,6 +1713,13 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
     return res;
   };
 
+  // Add 1 day to a YYYY-MM-DD string (local-safe)
+  const fcEndDate = dateStr => {
+    const [y,m,d] = dateStr.split("-").map(Number);
+    const dt = new Date(y, m-1, d+1);
+    return dt.getFullYear()+"-"+String(dt.getMonth()+1).padStart(2,"0")+"-"+String(dt.getDate()).padStart(2,"0");
+  };
+
   const buildEvents = (staysArr,propsArr,jobsArr,hiddenSet) => {
     const turnovers = getTurnovers(staysArr);
     return staysArr.filter(s=>!hiddenSet.has(s.propId)).map(s=>{
@@ -1688,7 +1728,9 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
       const job = jobsArr.find(j=>j.propertyId===s.propId&&j.checkoutDate===s.end);
       const isTurnover = turnovers.has(`${s.propId}_${s.start}`);
       return {
-        id: s.uid, start: s.start, end: s.end, allDay: true, title: prop.name,
+        // FullCalendar all-day end is exclusive, so add 1 day so the bar visually
+        // covers through the checkout date — matching what the dashboard shows
+        id: s.uid, start: s.start, end: fcEndDate(s.end), allDay: true, title: prop.name,
         backgroundColor: prop.color, borderColor: prop.color,
         classNames: isTurnover?['fc-ev-turnover']:[],
         extendedProps: {stay:s,prop,job,isTurnover},
@@ -2390,11 +2432,28 @@ function App() {
       .fc .fc-daygrid-event-harness{margin-bottom:2px!important}
       .fc .fc-list-event-dot{border-color:inherit!important}
       @media(max-width:640px){.fc .fc-toolbar{flex-wrap:wrap;gap:6px}.fc .fc-toolbar-title{font-size:15px!important}.fc .fc-button-primary{font-size:11px!important;padding:5px 9px!important}}
+      @media(max-width:640px){
+        .br-nav{padding:0 12px!important;height:52px!important}
+        .br-nav-user{display:none!important}
+        .br-signout{font-size:11px!important;padding:4px 8px!important}
+        .br-tabs-wrap{overflow-x:auto!important;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+        .br-tabs-wrap::-webkit-scrollbar{display:none}
+        .br-tab-btn{flex:0 0 auto!important;padding:9px 10px!important;font-size:11px!important;white-space:nowrap!important}
+        .br-content{padding:12px 12px!important}
+        .br-section-pills{width:100%!important}
+        .br-section-pills button{flex:1!important;padding:7px 8px!important;font-size:12px!important}
+        .br-hero{padding:18px 16px!important;gap:14px!important}
+        .br-hero-stats{gap:14px!important;flex-wrap:wrap!important}
+        .br-hero-stat-num{font-size:20px!important}
+        .br-modal-inner{padding:20px 16px!important;border-radius:14px!important}
+        .br-member-row{flex-wrap:wrap!important}
+        .br-member-actions{flex-wrap:wrap!important;margin-left:50px}
+      }
     `}</style>
 
     <div style={{minHeight:"100vh",background:"#EEF2FF",fontFamily:FONT}}>
       {/* Nav */}
-      <div style={{background:COLORS.white,borderBottom:`1px solid ${COLORS.border}`,padding:"0 24px",display:"flex",alignItems:"center",justifyContent:"space-between",height:60,position:"sticky",top:0,zIndex:50,boxShadow:"0 1px 8px rgba(0,0,0,0.05)"}}>
+      <div className="br-nav" style={{background:COLORS.white,borderBottom:`1px solid ${COLORS.border}`,padding:"0 24px",display:"flex",alignItems:"center",justifyContent:"space-between",height:60,position:"sticky",top:0,zIndex:50,boxShadow:"0 1px 8px rgba(0,0,0,0.05)"}}>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
           <div style={{width:32,height:32,borderRadius:9,background:COLORS.navy,display:"flex",alignItems:"center",justifyContent:"center"}}>
             <span style={{color:"#fff",fontSize:14,fontWeight:800}}>B</span>
@@ -2408,11 +2467,11 @@ function App() {
           <div style={{width:8,height:8,borderRadius:"50%",background:online?COLORS.green:"#F59E0B"}} title={online?"Real-time sync active":"Offline — changes will sync when reconnected"}/>
           {isOwner&&pendingCount>0&&<div onClick={()=>setTab("team")} title={`${pendingCount} pending`} style={{width:22,height:22,borderRadius:"50%",background:COLORS.red,color:"#fff",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer"}}>{pendingCount}</div>}
           <Avatar name={currentUser.name} size={30}/>
-          <div style={{lineHeight:1.2}}>
+          <div className="br-nav-user" style={{lineHeight:1.2}}>
             <div style={{fontSize:12,fontWeight:700,color:COLORS.navy}}>{currentUser.name}</div>
             <div style={{fontSize:10,color:COLORS.slate,textTransform:"capitalize"}}>{currentUser.role==="owner"?"Owner":currentUser.role==="manager"?"Manager":currentUser.role==="landscaper"?"Landscaper":currentUser.role==="garbage"?"Garbage Collector":"Cleaner"}</div>
           </div>
-          <button onClick={handleLogout} style={{background:"none",border:`1.5px solid ${COLORS.border}`,borderRadius:8,padding:"5px 12px",cursor:"pointer",fontFamily:FONT,fontSize:12,color:COLORS.slate,fontWeight:600}}>Sign out</button>
+          <button className="br-signout" onClick={handleLogout} style={{background:"none",border:`1.5px solid ${COLORS.border}`,borderRadius:8,padding:"5px 12px",cursor:"pointer",fontFamily:FONT,fontSize:12,color:COLORS.slate,fontWeight:600}}>Sign out</button>
         </div>
       </div>
 
@@ -2428,8 +2487,8 @@ function App() {
       </div>}
 
       {/* Content */}
-      <div style={{maxWidth:tab==="calendar"?1100:860,margin:"0 auto",padding:"24px 20px"}}>
-        {!isWorker&&<div style={{display:"flex",gap:6,marginBottom:16,background:COLORS.white,padding:"6px 8px",borderRadius:14,border:`1px solid ${COLORS.border}`,width:"fit-content",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+      <div className="br-content" style={{maxWidth:tab==="calendar"?1100:860,margin:"0 auto",padding:"24px 20px"}}>
+        {!isWorker&&<div className="br-section-pills" style={{display:"flex",gap:6,marginBottom:16,background:COLORS.white,padding:"6px 8px",borderRadius:14,border:`1px solid ${COLORS.border}`,width:"fit-content",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
           {[
             {id:"cleaning",  label:"Cleaning",    icon:"🧹"},
             {id:"landscape", label:"Landscaping", icon:"🌿"},
@@ -2450,7 +2509,7 @@ function App() {
         {tab==="dashboard"  &&!isWorker&&<DashboardView jobs={jobs} inventory={inventory} properties={properties} currentUser={currentUser} stays={stays} maintenance={maintenance}/>}
         {tab==="calendar"  &&<OpsCalendarView stays={stays} properties={properties} jobs={jobs} currentUser={currentUser} accounts={accounts}/>}
         {tab==="sync"      &&!isWorker&&<CalendarView stays={stays} jobs={jobs} properties={properties} accounts={accounts} currentUser={currentUser} readOnly={false}/>}
-        {tab==="jobs"      &&!isWorker&&<JobsView jobs={jobs} properties={properties} accounts={accounts} currentUser={currentUser}/>}
+        {tab==="jobs"      &&!isWorker&&<JobsView jobs={jobs} stays={stays} properties={properties} accounts={accounts} currentUser={currentUser}/>}
         {tab==="landscape"  &&!isWorker&&<ScheduleManagerView jobs={landscapeJobs} jobType="landscape" accounts={accounts} properties={properties} currentUser={currentUser}/>}
         {tab==="garbage"    &&!isWorker&&<ScheduleManagerView jobs={garbageJobs} jobType="garbage" accounts={accounts} properties={properties} currentUser={currentUser}/>}
         {tab==="maintenance"&&<MaintenanceView maintenance={maintenance} properties={properties} currentUser={currentUser}/>}
@@ -2462,7 +2521,7 @@ function App() {
 }
 
 // ─── JOBS VIEW ────────────────────────────────────────────────────────────────
-function JobsView({jobs,properties,accounts,currentUser}) {
+function JobsView({jobs,stays,properties,accounts,currentUser}) {
   const db = useContext(DbCtx);
   const [filter,setFilter]=useState("all");
   const [showModal,setShowModal]=useState(null);
@@ -2470,7 +2529,13 @@ function JobsView({jobs,properties,accounts,currentUser}) {
   const [newJob,setNewJob]=useState({propertyId:"",checkoutDate:"",checkinDate:"",cleaner:""});
   const cleaners = accounts.filter(a=>a.authorized&&(a.role==="cleaner"||a.role==="manager"||a.role==="owner")).map(a=>a.name);
   const filtered = filter==="all"?jobs:jobs.filter(j=>j.status===filter);
-  const sorted = filtered.slice().sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate));
+  // Sort then deduplicate: one job per (propertyId + checkoutDate). Prefer jobs with a
+  // cleaner assigned, then iCal-synced jobs (id starts with "ical_"), then first created.
+  const sorted = (()=>{
+    const s = filtered.slice().sort((a,b)=>a.checkoutDate.localeCompare(b.checkoutDate)||(b.cleaner?1:0)-(a.cleaner?1:0));
+    const seen = new Set();
+    return s.filter(j=>{ const k=`${j.propertyId}_${j.checkoutDate}`; if(seen.has(k))return false; seen.add(k); return true; });
+  })();
 
   const updateStatus = async (jobId,newStatus) => {
     const now = new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
@@ -2513,7 +2578,7 @@ function JobsView({jobs,properties,accounts,currentUser}) {
                 <Badge config={jobStatusCfg[job.status]} small/>
                 {!job.cleaner&&<span style={{fontSize:11,color:COLORS.amber,fontWeight:600}}>Unassigned</span>}
               </div>
-              <div style={{fontSize:12,color:COLORS.slate,marginBottom:3}}>Checkout: {fmtDate(job.checkoutDate)}{job.checkinDate?` → Check-in: ${fmtDate(job.checkinDate)}`:""}</div>
+              {(()=>{const stay=(stays||[]).find(s=>s.propId===job.propertyId&&s.end===job.checkoutDate);return <div style={{fontSize:12,color:COLORS.slate,marginBottom:3}}>{stay?`${fmtDate(stay.start)} → ${fmtDate(stay.end)}`:`Checkout: ${fmtDate(job.checkoutDate)}`}</div>;})()}
               <div style={{fontSize:12,color:COLORS.slate,display:"flex",gap:12}}>
                 {job.cleaner&&<span>👤 {job.cleaner}</span>}
                 {job.arrivedAt&&<span>🕐 Arrived {job.arrivedAt}</span>}
@@ -2534,7 +2599,7 @@ function JobsView({jobs,properties,accounts,currentUser}) {
           <Badge config={jobStatusCfg[showModal.status]}/>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
-          {[["Checkout",fmtDate(showModal.checkoutDate)],["Check-in",showModal.checkinDate?fmtDate(showModal.checkinDate):"TBD"],["Arrived",showModal.arrivedAt||"—"],["Completed",showModal.completedAt||"—"]].map(([l,v])=>(
+          {(()=>{const ms=(stays||[]).find(s=>s.propId===showModal.propertyId&&s.end===showModal.checkoutDate);return[["Check-in",ms?fmtDate(ms.start):"—"],["Checkout",fmtDate(showModal.checkoutDate)],["Arrived",showModal.arrivedAt||"—"],["Completed",showModal.completedAt||"—"]];})().map(([l,v])=>(
             <div key={l} style={{background:COLORS.surface,borderRadius:10,padding:"10px 14px"}}>
               <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>{l}</div>
               <div style={{fontSize:13,fontWeight:600,color:COLORS.navy}}>{v}</div>
