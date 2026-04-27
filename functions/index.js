@@ -706,22 +706,41 @@ exports.onGarbageJobCreated = functions.database.ref("/garbageJobs/{jobId}").onC
   const job  = snap.val();
   const prop = await getProp(job.propertyId);
   const dateShort = job.scheduledDate ? fmtCheckoutShort(job.scheduledDate) : "";
+  const dateLong  = fmtCheckout(job.scheduledDate);
 
-  const subject = `🗑 New Garbage Pickup — ${prop.name}${dateShort ? ` · ${dateShort}` : ""}`;
-  const html = emailHtml({
-    subject,
+  const ownerSubject = `🗑 New Garbage Pickup — ${prop.name}${dateShort ? ` · ${dateShort}` : ""}`;
+  const ownerHtml = emailHtml({
+    subject: ownerSubject,
     rows: [
       row("Property",       prop.name),
       row("Address",        prop.address),
-      row("Scheduled Date", `<strong>${fmtCheckout(job.scheduledDate)}</strong>`),
+      row("Scheduled Date", `<strong>${dateLong}</strong>`),
       actionRow("Created by", job.createdBy || "System"),
+      actionRow("Assigned to", job.worker || "Unassigned"),
       row("Notes",          job.notes || "—"),
-      row("Status",         "Pending — no worker assigned"),
     ],
     cta: tabLink("garbage", "View Garbage"),
   });
-  await sendEmail(subject, html);
-  console.log(`[onGarbageJobCreated] Notified owners — ${prop.name}`);
+  const tasks = [sendEmail(ownerSubject, ownerHtml)];
+
+  // Notify the worker immediately if already assigned at creation (e.g. auto-scheduled jobs)
+  if (job.worker) {
+    const ws = `🗑 New garbage pickup confirmed — ${prop.name} · ${dateShort || dateLong}`;
+    tasks.push(notifyWorker(job.worker, ws, emailHtml({
+      subject: ws, badge: "Job Confirmed", badgeColor: "#6B7280",
+      rows: [
+        row("Property",       prop.name),
+        row("Address",        prop.address),
+        row("Scheduled Date", `<strong>${dateLong}</strong>`),
+        row("Notes",          job.notes || "—"),
+      ],
+      note: `You have a garbage pickup confirmed at <strong>${prop.name}</strong> on <strong>${dateLong}</strong>.`,
+      cta: tabLink("myjobs", "View My Jobs"),
+    })));
+  }
+
+  await Promise.all(tasks);
+  console.log(`[onGarbageJobCreated] Notified owners${job.worker ? ` + ${job.worker}` : ""} — ${prop.name}`);
 });
 
 exports.onGarbageJobUpdated = functions.database.ref("/garbageJobs/{jobId}").onUpdate(async (change) => {
@@ -966,6 +985,8 @@ function parseIcalText(text) {
   let m;
   while ((m = re.exec(text)) !== null) {
     const b = m[1];
+    const summary = (b.match(/SUMMARY:([^\r\n]+)/)?.[1] || "").trim();
+    if (/not available|blocked|unavailable/i.test(summary)) continue;
     const ds = b.match(/DTSTART(?:;[^\r\n:]*)?:(\d{8})/)?.[1];
     const de = b.match(/DTEND(?:;[^\r\n:]*)?:(\d{8})/)?.[1];
     const uid = b.match(/UID:([^\r\n]+)/)?.[1]?.trim();
@@ -1057,5 +1078,79 @@ exports.autoSyncIcal = functions.pubsub.schedule("*/30 * * * *")
       } catch (e) {
         console.error(`[autoSyncIcal] Error syncing ${prop.name}:`, e.message);
       }
+    }
+  });
+
+// ─── AUTO GARBAGE SCHEDULING (daily 10 AM Toronto) ───────────────────────────
+// Runs daily so that new bookings get a garbage job created within 24 hours.
+// For each property, scans ALL future stays and creates a garbage job for every
+// Sunday whose week (Mon–Sun) overlaps a booking — months in advance.
+
+function addDays(dateStr, days) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d + days));
+  return date.toISOString().slice(0, 10);
+}
+
+function sundayOfWeek(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0=Sun
+  return addDays(dateStr, dow === 0 ? 0 : 7 - dow);
+}
+
+exports.autoScheduleGarbage = functions.pubsub.schedule("0 10 * * *")
+  .timeZone("America/Toronto")
+  .onRun(async () => {
+    const todayStr = tzDateStr(0);
+    console.log(`[autoScheduleGarbage] Running for ${todayStr}`);
+
+    const propsSnap = await db.ref("properties").once("value");
+    const properties = Object.values(propsSnap.val() || {});
+
+    for (const prop of properties) {
+      if (!prop.id || !prop.garbageWorker) continue;
+
+      const staysSnap = await db.ref(`stays/${prop.id}`).once("value");
+      const stays = Object.values(staysSnap.val() || {});
+
+      // Build the set of all Sundays that need a garbage job
+      const sundaysNeeded = new Set();
+      for (const stay of stays) {
+        if (!stay.start || !stay.end) continue;
+        if (stay.end < todayStr) continue; // fully in the past, skip
+
+        // Sunday of the week that contains check-in → Sunday of the week that contains checkout
+        let cur = sundayOfWeek(stay.start);
+        const last = sundayOfWeek(stay.end);
+        while (cur <= last) {
+          if (cur >= todayStr) sundaysNeeded.add(cur);
+          cur = addDays(cur, 7);
+        }
+      }
+
+      // Create a job for every Sunday that doesn't already have one
+      let created = 0;
+      for (const sundayStr of sundaysNeeded) {
+        const jobId = `auto_garbage_${prop.id}_${sundayStr}`;
+        const existing = await db.ref(`garbageJobs/${jobId}`).once("value");
+        if (existing.val()) continue;
+
+        const now = new Date().toISOString();
+        await db.ref(`garbageJobs/${jobId}`).set({
+          id: jobId,
+          propertyId: prop.id,
+          scheduledDate: sundayStr,
+          worker: prop.garbageWorker,
+          status: "pending",
+          notes: "",
+          pickupType: "",
+          createdBy: "System (auto-schedule)",
+          createdAt: now,
+          updatedAt: now,
+        });
+        created++;
+        console.log(`[autoScheduleGarbage] Created job for ${prop.name} → ${prop.garbageWorker} on ${sundayStr}`);
+      }
+      if (created > 0) console.log(`[autoScheduleGarbage] ${prop.name} — ${created} new job(s) scheduled`);
     }
   });
