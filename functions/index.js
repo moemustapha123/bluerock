@@ -36,15 +36,24 @@ async function getCleanerAccount(cleanerName) {
   return accs[0] || null;
 }
 
+// Send email + FCM push to all accounts with role "cleaner"
+async function notifyAllCleaners(subject, html) {
+  const snap = await db.ref("accounts").orderByChild("role").equalTo("cleaner").once("value");
+  const cleaners = Object.values(snap.val() || {});
+  await Promise.all(cleaners.map(acc => notifyCleanerAccount(acc, subject, html)));
+}
+
 // Send email + FCM push to a specific cleaner
 async function notifyCleaner(cleanerName, subject, html) {
   const acc = await getCleanerAccount(cleanerName);
   if (!acc) return;
-  // Email
+  await notifyCleanerAccount(acc, subject, html);
+}
+
+async function notifyCleanerAccount(acc, subject, html) {
   if (acc.email) {
     await sendToExtra(acc.email, subject, html);
   }
-  // FCM push (fires only if the cleaner has granted notification permission in the app)
   if (acc.fcmToken) {
     try {
       const body = subject.replace(/[\u{1F300}-\u{1FFFF}]/gu, "").trim();
@@ -53,10 +62,10 @@ async function notifyCleaner(cleanerName, subject, html) {
         notification: { title: "Bluerock Property Management", body },
         webpush: {
           notification: { icon: "https://bluerock-property-management.web.app/icon.png", badge: "1" },
-          fcmOptions: { link: `${APP_URL()}#myjobs` },
+          fcmOptions: { link: `${APP_URL()}#jobs` },
         },
       });
-    } catch (e) { console.warn(`FCM push failed for ${cleanerName}:`, e.message); }
+    } catch (e) { console.warn(`FCM push failed for ${acc.name}:`, e.message); }
   }
 }
 
@@ -205,12 +214,13 @@ exports.onJobCreated = functions.database.ref("/jobs/{jobId}").onCreate(async (s
   });
 
   await sendEmail(subject, html);
+  await notifyAllCleaners(subject, html);
 
   // Cleaning company — new job alert only. Uncomment the line below to activate.
   // const CLEANING_CO_EMAIL = "hello@getcleanaf.ca";
   await sendToExtra(/* CLEANING_CO_EMAIL */ null, subject, html);
 
-  console.log(`[onJobCreated] Notified owners — ${prop.name}`);
+  console.log(`[onJobCreated] Notified owners and all cleaners — ${prop.name}`);
 });
 
 exports.onJobUpdated = functions.database.ref("/jobs/{jobId}").onUpdate(async (change) => {
@@ -576,6 +586,12 @@ exports.onMaintenanceUpdated = functions.database.ref("/maintenance/{ticketId}")
 
 // ─── LANDSCAPE / GARBAGE HELPERS ─────────────────────────────────────────────
 
+async function notifyAllLandscapers(subject, html) {
+  const snap = await db.ref("accounts").orderByChild("role").equalTo("landscaper").once("value");
+  const workers = Object.values(snap.val() || {});
+  await Promise.all(workers.map(acc => notifyWorker(acc.name, subject, html)));
+}
+
 async function notifyWorker(workerName, subject, html) {
   const acc = await getCleanerAccount(workerName); // same lookup by name
   if (!acc) return;
@@ -616,7 +632,8 @@ exports.onLandscapeJobCreated = functions.database.ref("/landscapeJobs/{jobId}")
     cta: tabLink("landscape", "View Landscape"),
   });
   await sendEmail(subject, html);
-  console.log(`[onLandscapeJobCreated] Notified owners — ${prop.name}`);
+  await notifyAllLandscapers(subject, html);
+  console.log(`[onLandscapeJobCreated] Notified owners and all landscapers — ${prop.name}`);
 });
 
 exports.onLandscapeJobUpdated = functions.database.ref("/landscapeJobs/{jobId}").onUpdate(async (change) => {
@@ -1005,6 +1022,16 @@ async function fetchIcalDirect(url) {
   }
   return null;
 }
+
+exports.fetchIcalUrl = functions.https.onCall(async (data) => {
+  const { url } = data;
+  if (!url || typeof url !== "string" || !url.startsWith("https://")) {
+    throw new functions.https.HttpsError("invalid-argument", "A valid HTTPS URL is required");
+  }
+  const text = await fetchIcalDirect(url);
+  if (!text) throw new functions.https.HttpsError("unavailable", "Could not fetch calendar");
+  return { text };
+});
 
 exports.autoSyncIcal = functions.pubsub.schedule("*/30 * * * *")
   .timeZone("America/Toronto")

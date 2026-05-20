@@ -7,6 +7,7 @@
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-messaging-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-functions-compat.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.js"></script>
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -42,6 +43,69 @@ const maintStatusCfg = {
   resolved:      {label:"Resolved",     bg:"#D1FAE5",color:"#065F46",dot:"#10B981"},
 };
 const NEXT_MAINT = {open:"scheduled",scheduled:"in-progress","in-progress":"resolved"};
+
+const CLEANING_CHECKLIST = [
+  {section:"Arrival & General", items:[
+    "Take before pictures",
+    "Note and report any damages or maintenance issues",
+    "Remove all dirty linens and towels and start with laundry"
+  ]},
+  {section:"Bedrooms", items:[
+    "Remake all beds with fresh linen",
+    "Arrange pillows neatly",
+    "Wipe down bedside tables and lamps",
+    "Dust all surfaces and furniture",
+    "Vacuum floors and under beds",
+    "Replace used amenities if empty"
+  ]},
+  {section:"Bathrooms", items:[
+    "Clean and disinfect toilet inside and out",
+    "Scrub shower/bath and remove any hair",
+    "Clean sink and wipe taps until streak-free",
+    "Wipe mirror and glass surfaces",
+    "Mop or scrub floor",
+    "Restock fresh towels (folded neatly)",
+    "Refill soap, shampoo, conditioner, and body wash",
+    "Replace toilet roll and leave 2 spares on holder",
+    "Empty and wipe bin",
+    "Check and clean extractor fan cover"
+  ]},
+  {section:"Kitchen", items:[
+    "Wash, dry, and put away all dishes and utensils",
+    "Wipe down all countertops and splashbacks",
+    "Clean stovetop and remove grease",
+    "Clean inside and outside of microwave",
+    "Wipe down outside of oven, fridge, and dishwasher",
+    "Check fridge — remove old food and wipe shelves",
+    "Empty dishwasher and run if needed",
+    "Wipe cabinet fronts",
+    "Clean and dry sink",
+    "Empty bin and replace liner",
+    "Sweep and mop floor",
+    "Restock tea, coffee, sugar, salt, pepper, creamer, and dish soap"
+  ]},
+  {section:"Living & Dining Areas", items:[
+    "Straighten sofa cushions",
+    "Wipe down all hard surfaces and tables",
+    "Dust shelving, ornaments, and artwork",
+    "Vacuum sofas and rugs",
+    "Vacuum or sweep and mop floor",
+    "Tidy any books, games, or décor items"
+  ]},
+  {section:"Entrance & Hallways", items:[
+    "Sweep or vacuum entrance area",
+    "Wipe down front door inside and out",
+    "Clean mirrors and light switches",
+    "Ensure coat hooks and shoe area are clear"
+  ]},
+  {section:"Final Checks", items:[
+    "All windows and external doors are locked",
+    "Keys are in lockbox",
+    "Take photos of completed property and upload them",
+    "Log completion time in the property management system"
+  ]}
+];
+const CHECKLIST_TOTAL = CLEANING_CHECKLIST.reduce((s,g)=>s+g.items.length,0);
 
 // ─── DB CONTEXT ───────────────────────────────────────────────────────────────
 const DbCtx = createContext(null);
@@ -88,24 +152,30 @@ function parseIcal(text) {
   return events.sort((a,b) => a.start.localeCompare(b.start));
 }
 async function fetchIcal(url) {
-  // 1. Direct (works only if server allows CORS)
+  // 1. Server-side via Cloud Function (bypasses CORS entirely)
+  try {
+    const fn = firebase.functions().httpsCallable("fetchIcalUrl");
+    const result = await fn({ url });
+    if (result.data?.text?.includes("BEGIN:VCALENDAR")) return result.data.text;
+  } catch {}
+  // 2. Direct (works only if server allows CORS)
   try { const r = await fetch(url, {mode:"cors"}); if (r.ok) { const t = await r.text(); if (t.includes("BEGIN:VCALENDAR")) return t; } } catch {}
-  // 2. corsproxy.io
+  // 3. corsproxy.io
   try {
     const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`);
     if (r.ok) { const t = await r.text(); if (t.includes("BEGIN:VCALENDAR")) return t; }
   } catch {}
-  // 3. allorigins.win
+  // 4. allorigins.win
   try {
     const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`);
     if (r.ok) { const d = await r.json(); if (d.contents && d.contents.includes("BEGIN:VCALENDAR")) return d.contents; }
   } catch {}
-  // 4. thingproxy.freeboard.io
+  // 5. thingproxy.freeboard.io
   try {
     const r = await fetch(`https://thingproxy.freeboard.io/fetch/${url}`);
     if (r.ok) { const t = await r.text(); if (t.includes("BEGIN:VCALENDAR")) return t; }
   } catch {}
-  // 5. api.codetabs.com
+  // 6. api.codetabs.com
   try {
     const r = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`);
     if (r.ok) { const t = await r.text(); if (t.includes("BEGIN:VCALENDAR")) return t; }
@@ -115,10 +185,12 @@ async function fetchIcal(url) {
 
 // ─── IMAGE COMPRESSION ───────────────────────────────────────────────────────
 async function compressImage(file, maxDim=1200, quality=0.75) {
-  return new Promise(res => {
+  return new Promise((res, rej) => {
     const reader = new FileReader();
+    reader.onerror = () => rej(new Error("Could not read file: " + file.name));
     reader.onload = ev => {
       const img = new Image();
+      img.onerror = () => rej(new Error("Unsupported image format: " + file.name));
       img.onload = () => {
         const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
         const canvas = document.createElement("canvas");
@@ -142,6 +214,7 @@ const statusColor = st => ({ past:{bg:"#F1F5F9",color:"#64748B"}, active:{bg:"#D
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 const jobStatusCfg = {
+  open:          {label:"Open",        bg:"#EDE9FE", color:"#6D28D9", dot:"#7C3AED"},
   pending:       {label:"Pending",     bg:"#FEF3C7", color:"#D97706", dot:"#F59E0B"},
   "in-progress": {label:"In Progress", bg:"#DBEAFE", color:"#1D4ED8", dot:"#3B82F6"},
   complete:      {label:"Complete",    bg:"#D1FAE5", color:"#065F46", dot:"#10B981"},
@@ -460,7 +533,12 @@ function CalendarView({stays,jobs,properties,accounts,currentUser,readOnly}) {
       if (!text && prop.icalUrl) text = await fetchIcal(prop.icalUrl);
       if (!text) throw new Error("Could not fetch calendar via any proxy. Airbnb may be blocking automated requests — use the \"Paste iCal content\" option below instead.");
       const events = parseIcal(text);
-      if (events.length===0) throw new Error("No bookings found in this calendar.");
+      if (events.length===0) {
+        await db.ref(`properties/${prop.id}`).update({lastSynced:new Date().toISOString()});
+        setSyncRes(v=>({...v,[prop.id]:{ok:true,msg:"✓ Calendar connected — no bookings yet. New reservations will sync automatically."}}));
+        setSyncing(v=>({...v,[prop.id]:false}));
+        return;
+      }
 
       // Save stays to Firebase
       const staysRef = db.ref(`stays/${prop.id}`);
@@ -654,10 +732,14 @@ function StayCard({stay,prop,job,readOnly,currentUser}) {
             </div>
           </div>
         </div>
-        {/* Owner: status actions only — cleaners self-assign */}
+        {/* Owner: cleaner removal + status actions + checklist view */}
         {!readOnly&&<>
+          {job.cleaner&&<Btn variant="ghost" small onClick={()=>assignCleaner(null)}
+            style={{width:"100%",justifyContent:"center",marginBottom:6,color:COLORS.red,borderColor:COLORS.red}}>× Remove Cleaner</Btn>}
           {job.status==="pending"&&<Btn variant="amber" small onClick={()=>updateJobStatus("in-progress")} style={{width:"100%",justifyContent:"center"}}>🕐 Mark In Progress</Btn>}
           {job.status==="in-progress"&&<Btn variant="green" small onClick={()=>updateJobStatus("complete")} style={{width:"100%",justifyContent:"center"}}>✓ Mark Complete</Btn>}
+          {(job.status==="in-progress"||job.status==="complete")&&
+            <ChecklistPanel jobId={job.id} readOnly={true} defaultCollapsed={true}/>}
         </>}
         {/* Cleaner: claim / release / start / complete */}
         {readOnly&&<>
@@ -801,6 +883,12 @@ function EditPropertyModal({prop,onClose}) {
           </select>
         </div>
       </div>
+<<<<<<< Updated upstream
+=======
+      <div style={{background:COLORS.sky,borderRadius:8,padding:"10px 14px",fontSize:12,color:COLORS.slate}}>
+        🗑 Garbage jobs are auto-scheduled every Sunday for properties with bookings in the past 7 days. No manual assignment needed.
+      </div>
+>>>>>>> Stashed changes
     </div>
     <div style={{display:"flex",gap:10,marginTop:20}}>
       <Btn onClick={save}>Save</Btn>
@@ -1098,46 +1186,142 @@ function InventoryView({inventory,properties,currentUser}) {
   </div>;
 }
 
-// ─── MY JOBS VIEW ────────────────────────────────────────────────────────────
-function MyJobsView({jobs, properties, currentUser}) {
+// ─── CLEANING CHECKLIST PANEL ─────────────────────────────────────────────────
+function ChecklistPanel({jobId, readOnly, onProgress, defaultCollapsed=false}) {
   const db = useContext(DbCtx);
-  const [selected, setSelected] = useState(null);
-  const [showDone, setShowDone] = useState(false);
-  const todayStr = today();
+  const [data,      setData]      = useState({});
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
 
-  const myJobs = jobs
-    .filter(j => j.cleaner === currentUser.name)
-    .sort((a,b) => a.checkoutDate.localeCompare(b.checkoutDate));
+  useEffect(() => {
+    if (!jobId || !db) return;
+    const ref = db.ref(`jobChecklist/${jobId}`);
+    ref.on("value", snap => {
+      const v = snap.val() || {};
+      setData(v);
+      if (onProgress) onProgress(Object.values(v).filter(Boolean).length);
+    });
+    return () => ref.off();
+  }, [jobId]);
 
-  const todayJobs    = myJobs.filter(j => j.checkoutDate === todayStr && j.status !== "complete");
-  const upcomingJobs = myJobs.filter(j => j.checkoutDate > todayStr  && j.status !== "complete");
-  const doneJobs     = myJobs.filter(j => j.status === "complete").slice().reverse().slice(0,10);
+  const count = Object.values(data).filter(Boolean).length;
+  const pct   = CHECKLIST_TOTAL > 0 ? (count / CHECKLIST_TOTAL) * 100 : 0;
+  const done  = count === CHECKLIST_TOTAL;
 
-  const updateStatus = async (job, status) => {
+  const toggle = async (itemKey) => {
+    if (readOnly || !db) return;
+    await db.ref(`jobChecklist/${jobId}/${itemKey}`).set(!data[itemKey]);
+  };
+
+  return (
+    <div style={{marginTop:12}}>
+      <div onClick={() => setCollapsed(v => !v)}
+           style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",
+                   background:done?"#D1FAE5":COLORS.surface,
+                   borderRadius:collapsed?"10px":"10px 10px 0 0",
+                   padding:"10px 14px",
+                   border:`1px solid ${done?"#6EE7B7":COLORS.border}`}}>
+        <div style={{flex:1}}>
+          <div style={{fontSize:10,fontWeight:700,color:COLORS.slate,letterSpacing:1,marginBottom:5}}>
+            CLEANING CHECKLIST
+          </div>
+          <div style={{height:6,background:COLORS.border,borderRadius:6,overflow:"hidden"}}>
+            <div style={{height:"100%",background:done?COLORS.green:COLORS.blue,
+                         width:`${pct}%`,transition:"width .3s"}}/>
+          </div>
+        </div>
+        <span style={{fontSize:12,fontWeight:700,color:done?"#059669":COLORS.navy,whiteSpace:"nowrap"}}>
+          {count}/{CHECKLIST_TOTAL}
+        </span>
+        <span style={{fontSize:14,color:COLORS.slate,transition:"transform .2s",
+                      transform:collapsed?"none":"rotate(90deg)"}}>›</span>
+      </div>
+
+      {!collapsed && (
+        <div style={{background:"#fff",border:`1px solid ${COLORS.border}`,borderTop:"none",
+                     borderRadius:"0 0 10px 10px",padding:"12px 14px",
+                     maxHeight:480,overflowY:"auto"}}>
+          {(() => {
+            let idx = 0;
+            return CLEANING_CHECKLIST.map(group => {
+              const startIdx   = idx;
+              idx += group.items.length;
+              const groupDone  = group.items.filter((_,i) => !!data[`i${startIdx+i}`]).length;
+              return (
+                <div key={group.section} style={{marginBottom:14}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+                    <span style={{fontSize:10,fontWeight:700,color:COLORS.slate,
+                                  letterSpacing:1,textTransform:"uppercase"}}>
+                      {group.section}
+                    </span>
+                    <span style={{fontSize:10,fontWeight:600,
+                                  color:groupDone===group.items.length?"#059669":COLORS.slate}}>
+                      {groupDone}/{group.items.length}
+                    </span>
+                  </div>
+                  {group.items.map((item, i) => {
+                    const itemKey = `i${startIdx + i}`;
+                    const checked = !!data[itemKey];
+                    return (
+                      <div key={itemKey}
+                           onClick={() => toggle(itemKey)}
+                           style={{display:"flex",alignItems:"flex-start",gap:10,
+                                   padding:"8px 0",borderBottom:`1px solid ${COLORS.border}`,
+                                   cursor:readOnly?"default":"pointer"}}>
+                        <div style={{width:20,height:20,borderRadius:6,flexShrink:0,marginTop:1,
+                                     border:`2px solid ${checked?"#059669":COLORS.border}`,
+                                     background:checked?"#059669":"#fff",
+                                     display:"flex",alignItems:"center",justifyContent:"center",
+                                     transition:"all .15s"}}>
+                          {checked && <span style={{color:"#fff",fontSize:11,fontWeight:700,lineHeight:1}}>✓</span>}
+                        </div>
+                        <span style={{fontSize:13,color:checked?COLORS.slate:COLORS.navy,
+                                      textDecoration:checked?"line-through":"none",
+                                      flex:1,lineHeight:1.4}}>
+                          {item}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            });
+          })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── CLEANER JOB CARD ─────────────────────────────────────────────────────────
+function CleanerJobCard({job, properties, highlight, todayStr, onSelect}) {
+  const db = useContext(DbCtx);
+  const [checklistCount, setChecklistCount] = useState(0);
+
+  const prop     = properties.find(p => p.id === job.propertyId) || {name:"Unknown",color:"#94A3B8"};
+  const isToday  = job.checkoutDate === todayStr;
+  const dateLabel = isToday ? "Today"
+    : new Date(...job.checkoutDate.split("-").map((v,i) => i===1 ? v-1 : Number(v)))
+        .toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
+  const allChecked = checklistCount >= CHECKLIST_TOTAL;
+
+  const updateStatus = async (status) => {
     const now = new Date().toISOString();
     const update = {status, updatedAt:now};
-    if (status==="in-progress") update.arrivedAt = now;
-    if (status==="complete")    update.completedAt = now;
+    if (status === "in-progress") update.arrivedAt = now;
+    if (status === "complete")    update.completedAt = now;
     await db.ref(`jobs/${job.id}`).update(update);
   };
 
-  const JobCard = ({job, highlight=false}) => {
-    const prop = properties.find(p=>p.id===job.propertyId) || {name:"Unknown",color:"#94A3B8"};
-    const isToday   = job.checkoutDate === todayStr;
-    const dateLabel = isToday ? "Today" : new Date(...job.checkoutDate.split("-").map((v,i)=>i===1?v-1:Number(v)))
-      .toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
+  return (
+    <div onClick={() => onSelect({job, prop})}
+         style={{background:"#fff",borderRadius:16,overflow:"hidden",
+                 boxShadow:highlight?"0 4px 20px rgba(27,79,216,0.15)":"0 1px 4px rgba(0,0,0,0.07)",
+                 border:highlight?`2px solid ${COLORS.blue}`:`1.5px solid ${COLORS.border}`,
+                 marginBottom:12,cursor:"pointer"}}>
 
-    return <div onClick={()=>setSelected({job,prop})}
-      style={{background:"#fff",borderRadius:16,overflow:"hidden",
-              boxShadow:highlight?"0 4px 20px rgba(27,79,216,0.15)":"0 1px 4px rgba(0,0,0,0.07)",
-              border:highlight?`2px solid ${COLORS.blue}`:`1.5px solid ${COLORS.border}`,
-              marginBottom:12,cursor:"pointer"}}>
-
-      {/* Color bar */}
       <div style={{height:5,background:prop.color,width:"100%"}}/>
 
       <div style={{padding:"16px 18px"}}>
-        {/* Property + date */}
         <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:10,gap:8}}>
           <div>
             <div style={{fontWeight:700,fontSize:17,color:COLORS.navy,marginBottom:2}}>{prop.name}</div>
@@ -1156,13 +1340,11 @@ function MyJobsView({jobs, properties, currentUser}) {
           </div>
         </div>
 
-        {/* Timer */}
         {job.checkinDate&&<div style={{marginBottom:12,padding:"10px 14px",background:COLORS.surface,borderRadius:10}}>
           <div style={{fontSize:10,fontWeight:700,color:COLORS.slate,letterSpacing:1,marginBottom:4}}>CLEANING WINDOW</div>
           <TurnoverTimer job={job} prop={prop} large/>
         </div>}
 
-        {/* Status + actions */}
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:job.status!=="complete"?12:0}}>
           <Badge config={jobStatusCfg[job.status]} small/>
           {job.status==="in-progress"&&job.arrivedAt&&
@@ -1170,27 +1352,55 @@ function MyJobsView({jobs, properties, currentUser}) {
         </div>
 
         {job.status==="pending"&&<button
-          onClick={e=>{e.stopPropagation();updateStatus(job,"in-progress");}}
+          onClick={e=>{e.stopPropagation();updateStatus("in-progress");}}
           style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:"pointer",
                   background:COLORS.amber,color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,
                   display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
           🕐 Start Cleaning
         </button>}
 
-        {job.status==="in-progress"&&<button
-          onClick={e=>{e.stopPropagation();updateStatus(job,"complete");}}
-          style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:"pointer",
-                  background:COLORS.green,color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,
-                  display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
-          ✅ Mark Complete
-        </button>}
+        {job.status==="in-progress"&&<div onClick={e=>e.stopPropagation()}>
+          <ChecklistPanel
+            jobId={job.id}
+            readOnly={false}
+            onProgress={count => setChecklistCount(count)}
+          />
+          <button
+            onClick={() => { if (allChecked) updateStatus("complete"); }}
+            disabled={!allChecked}
+            style={{width:"100%",padding:"14px",borderRadius:12,border:"none",marginTop:12,
+                    cursor:allChecked?"pointer":"not-allowed",
+                    background:allChecked?COLORS.green:"#9CA3AF",
+                    color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,
+                    display:"flex",alignItems:"center",justifyContent:"center",gap:8,
+                    opacity:allChecked?1:0.65}}>
+            {allChecked ? "✅ Mark Complete" : `Complete checklist first (${checklistCount}/${CHECKLIST_TOTAL})`}
+          </button>
+        </div>}
 
         {job.status==="complete"&&<div style={{textAlign:"center",fontSize:13,fontWeight:600,color:"#059669",padding:"6px 0"}}>
           ✅ Completed {job.completedAt?new Date(job.completedAt).toLocaleDateString("en-US",{month:"short",day:"numeric"}):""}
         </div>}
       </div>
-    </div>;
-  };
+    </div>
+  );
+}
+
+// ─── MY JOBS VIEW ────────────────────────────────────────────────────────────
+function MyJobsView({jobs, properties, currentUser}) {
+  const db = useContext(DbCtx);
+  const [selected, setSelected] = useState(null);
+  const [showDone, setShowDone] = useState(false);
+  const todayStr = today();
+
+  const myJobs = jobs
+    .filter(j => j.cleaner === currentUser.name)
+    .sort((a,b) => a.checkoutDate.localeCompare(b.checkoutDate));
+
+  const todayJobs    = myJobs.filter(j => j.checkoutDate === todayStr && j.status !== "complete");
+  const upcomingJobs = myJobs.filter(j => j.checkoutDate > todayStr  && j.status !== "complete");
+  const doneJobs     = myJobs.filter(j => j.status === "complete").slice().reverse().slice(0,10);
+
 
   const Section = ({title, count, children, accent}) => (
     <div style={{marginBottom:24}}>
@@ -1222,12 +1432,12 @@ function MyJobsView({jobs, properties, currentUser}) {
 
     {/* Today */}
     {todayJobs.length>0&&<Section title="Today" count={todayJobs.length} accent="#DC2626">
-      {todayJobs.map(j=><JobCard key={j.id} job={j} highlight/>)}
+      {todayJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} highlight todayStr={todayStr} onSelect={setSelected}/>)}
     </Section>}
 
     {/* Upcoming */}
     {upcomingJobs.length>0&&<Section title="Upcoming" count={upcomingJobs.length}>
-      {upcomingJobs.map(j=><JobCard key={j.id} job={j}/>)}
+      {upcomingJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} todayStr={todayStr} onSelect={setSelected}/>)}
     </Section>}
 
     {/* Empty state */}
@@ -1245,7 +1455,7 @@ function MyJobsView({jobs, properties, currentUser}) {
                 width:"100%",marginBottom:12}}>
         {showDone?"▲ Hide":"▼ Show"} completed jobs ({doneJobs.length})
       </button>
-      {showDone&&doneJobs.map(j=><JobCard key={j.id} job={j}/>)}
+      {showDone&&doneJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} todayStr={todayStr} onSelect={setSelected}/>)}
     </div>}
 
     {/* Detail modal */}
@@ -1258,15 +1468,23 @@ function MyJobsView({jobs, properties, currentUser}) {
   </div>;
 }
 
-// ─── WORKER SCHEDULE VIEW (Landscaper + Garbage) ─────────────────────────────
+// ─── WORKER SCHEDULE VIEW (Landscaper) ───────────────────────────────────────
+function fmtTime(t) {
+  if (!t) return "";
+  const [h,m] = t.split(":").map(Number);
+  const ampm = h>=12?"PM":"AM";
+  const h12  = h%12||12;
+  return `${h12}:${String(m).padStart(2,"0")} ${ampm}`;
+}
+
 function WorkerScheduleView({jobs, jobType, currentUser, properties}) {
   const db       = useContext(DbCtx);
   const todayStr = today();
   const [showDone, setShowDone] = useState(false);
 
-  const icon      = jobType==="landscape" ? "🌿" : "🗑";
-  const accentColor = jobType==="landscape" ? "#059669" : "#6B7280";
-  const dbPath    = jobType==="landscape" ? "landscapeJobs" : "garbageJobs";
+  const icon      = "🌿";
+  const accentColor = "#059669";
+  const dbPath    = "landscapeJobs";
 
   const sorted = jobs.slice().sort((a,b)=>a.scheduledDate.localeCompare(b.scheduledDate));
   const todayJobs    = sorted.filter(j=>j.scheduledDate===todayStr&&j.status!=="complete");
@@ -1300,8 +1518,11 @@ function WorkerScheduleView({jobs, jobType, currentUser, properties}) {
             </div>
           </div>
         </div>
-        {job.notes&&<div style={{fontSize:12,color:COLORS.slate,background:COLORS.surface,padding:"8px 12px",borderRadius:8,marginBottom:12}}>📝 {job.notes}</div>}
-        {job.pickupType&&<div style={{fontSize:12,fontWeight:600,color:accentColor,marginBottom:10}}>{icon} {job.pickupType}</div>}
+        {job.notes&&<div style={{fontSize:12,color:COLORS.slate,background:COLORS.surface,padding:"8px 12px",borderRadius:8,marginBottom:8}}>📝 {job.notes}</div>}
+        {(job.windowStart||job.windowEnd)&&<div style={{display:"flex",alignItems:"center",gap:6,background:"#ECFDF5",border:"1px solid #6EE7B7",borderRadius:8,padding:"7px 12px",marginBottom:12}}>
+          <span style={{fontSize:14}}>⏰</span>
+          <span style={{fontSize:13,fontWeight:600,color:"#065F46"}}>Complete between {job.windowStart&&fmtTime(job.windowStart)}{job.windowStart&&job.windowEnd?" – ":""}{job.windowEnd&&fmtTime(job.windowEnd)}</span>
+        </div>}
         {job.status!=="complete"
           ?<button onClick={()=>markComplete(job)}
               style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:"pointer",
@@ -1363,18 +1584,204 @@ function WorkerScheduleView({jobs, jobType, currentUser, properties}) {
   </div>;
 }
 
+// ─── GARBAGE COLLECTOR VIEW ───────────────────────────────────────────────────
+// Open-claiming model: collectors see all unclaimed jobs and can grab one.
+function GarbageWorkerView({allGarbageJobs, currentUser, properties}) {
+  const db       = useContext(DbCtx);
+  const todayStr = today();
+  const tomorrowStr = (() => { const d=new Date(); d.setDate(d.getDate()+1); return d.toISOString().slice(0,10); })();
+  const [claiming, setClaiming] = useState(null); // jobId being claimed
+  const [showDone, setShowDone] = useState(false);
+  const [gcToast, setGcToast]  = useState(null);
+  const seenGcNotifIds = useRef(new Set());
+
+  // Listen for new open jobs via garbageNotifications
+  useEffect(() => {
+    if (!db) return;
+    const ref = db.ref("garbageNotifications");
+    ref.on("value", snap => {
+      const items = Object.values(snap.val() || {});
+      const newItems = items.filter(n => !seenGcNotifIds.current.has(n.jobId));
+      newItems.forEach(n => seenGcNotifIds.current.add(n.jobId));
+      if (newItems.length > 0) {
+        const prop = properties.find(p => p.id === newItems[0].propertyId);
+        setGcToast(`🗑 New garbage job available — ${prop?.name || "a property"} on ${fmtDate(newItems[0].scheduledDate)}`);
+        setTimeout(() => setGcToast(null), 7000);
+      }
+    });
+    return () => ref.off();
+  }, [db, properties]);
+
+  const myJobs   = allGarbageJobs.filter(j => j.worker === currentUser.name);
+  const openJobs = allGarbageJobs.filter(j => j.status === "open" && !j.worker);
+
+  const myActive  = myJobs.filter(j => j.status !== "complete").sort((a,b) => a.scheduledDate.localeCompare(b.scheduledDate));
+  const myDone    = myJobs.filter(j => j.status === "complete").sort((a,b) => b.scheduledDate.localeCompare(a.scheduledDate)).slice(0,10);
+  const myToday   = myActive.filter(j => j.scheduledDate === todayStr);
+  const myUpcoming = myActive.filter(j => j.scheduledDate > todayStr);
+
+  // Day-before / morning-of in-app reminder
+  const tomorrowJob = myActive.find(j => j.scheduledDate === tomorrowStr);
+  const todayJob    = myActive.find(j => j.scheduledDate === todayStr);
+
+  const claimJob = async job => {
+    setClaiming(job.id);
+    try {
+      const result = await db.ref(`garbageJobs/${job.id}`).transaction(current => {
+        if (!current || current.worker) return; // return undefined → abort (already claimed)
+        return { ...current, worker: currentUser.name, status: "pending", updatedAt: new Date().toISOString() };
+      });
+      if (!result.committed) {
+        setGcToast("⚠️ This job was just claimed by another collector.");
+        setTimeout(() => setGcToast(null), 4000);
+      }
+    } finally { setClaiming(null); }
+  };
+
+  const markComplete = async job => {
+    await db.ref(`garbageJobs/${job.id}`).update({status:"complete",completedAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
+  };
+
+  const Section = ({title, count, children, accent}) => <div style={{marginBottom:24}}>
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+      <h3 style={{fontFamily:DISPLAY,fontSize:15,fontWeight:700,color:accent||COLORS.navy}}>{title}</h3>
+      {count>0&&<span style={{background:accent||COLORS.blue,color:"#fff",fontSize:11,fontWeight:700,padding:"1px 8px",borderRadius:20}}>{count}</span>}
+    </div>
+    {children}
+  </div>;
+
+  const JobCard = ({job, highlight=false, isOpen=false}) => {
+    const prop = properties.find(p=>p.id===job.propertyId)||{name:"Unknown",color:"#94A3B8"};
+    const isToday   = job.scheduledDate === todayStr;
+    const dateLabel = isToday ? "Today" : new Date(...job.scheduledDate.split("-").map((v,i)=>i===1?v-1:Number(v)))
+      .toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
+    const isClaiming = claiming === job.id;
+
+    return <div style={{background:"#fff",borderRadius:16,overflow:"hidden",
+        boxShadow:highlight?"0 4px 20px rgba(27,79,216,0.15)":"0 1px 4px rgba(0,0,0,0.07)",
+        border:isOpen?`2px dashed #7C3AED`:highlight?`2px solid ${COLORS.blue}`:`1.5px solid ${COLORS.border}`,marginBottom:12}}>
+      <div style={{height:5,background:isOpen?"#7C3AED":prop.color,width:"100%"}}/>
+      <div style={{padding:"16px 18px"}}>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:10,gap:8}}>
+          <div>
+            <div style={{fontWeight:700,fontSize:17,color:COLORS.navy,marginBottom:2}}>{prop.name}</div>
+            {prop.address&&<div style={{fontSize:12,color:COLORS.slate}}>{prop.address}</div>}
+          </div>
+          <div style={{flexShrink:0,textAlign:"right"}}>
+            <div style={{fontSize:13,fontWeight:700,color:isToday?"#fff":COLORS.slate,
+                background:isToday?COLORS.blue:"transparent",padding:isToday?"3px 10px":"0",borderRadius:20}}>
+              {dateLabel}
+            </div>
+          </div>
+        </div>
+        {job.pickupType&&<div style={{fontSize:12,fontWeight:600,color:"#6B7280",marginBottom:8}}>🗑 {job.pickupType}</div>}
+        {job.notes&&<div style={{fontSize:12,color:COLORS.slate,background:COLORS.surface,padding:"8px 12px",borderRadius:8,marginBottom:10}}>📝 {job.notes}</div>}
+
+        {isOpen
+          ? <button disabled={!!isClaiming} onClick={()=>claimJob(job)}
+              style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:isClaiming?"wait":"pointer",
+                      background:"#7C3AED",color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,opacity:isClaiming?.7:1}}>
+              {isClaiming ? "Claiming…" : "🙋 Claim This Job"}
+            </button>
+          : job.status==="complete"
+            ? <div style={{textAlign:"center",fontSize:13,fontWeight:600,color:"#059669",padding:"6px 0"}}>
+                ✅ Completed {job.completedAt?new Date(job.completedAt).toLocaleDateString("en-US",{month:"short",day:"numeric"}):""}
+              </div>
+            : <button onClick={()=>markComplete(job)}
+                style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:"pointer",
+                        background:"#6B7280",color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700}}>
+                🗑 Mark Complete
+              </button>
+        }
+      </div>
+    </div>;
+  };
+
+  return <div style={{paddingBottom:40}}>
+    {/* Toast for new open jobs */}
+    {gcToast&&<div style={{position:"sticky",top:68,zIndex:90,background:COLORS.navy,color:"#fff",padding:"12px 16px",
+        borderRadius:12,fontSize:13,fontWeight:600,marginBottom:16,display:"flex",alignItems:"center",gap:10,
+        boxShadow:"0 4px 20px rgba(0,0,0,0.25)",animation:"slideUp 0.2s ease"}}>
+      <span style={{flex:1}}>{gcToast}</span>
+      <button onClick={()=>setGcToast(null)} style={{background:"none",border:"none",color:"rgba(255,255,255,0.7)",cursor:"pointer",fontSize:18,lineHeight:1}}>×</button>
+    </div>}
+
+    {/* Header */}
+    <div style={{background:`linear-gradient(135deg,${COLORS.navy},#1B3A6B)`,borderRadius:16,padding:"20px 22px",marginBottom:20}}>
+      <div style={{color:"rgba(255,255,255,0.6)",fontSize:12,marginBottom:3}}>
+        {new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"})}
+      </div>
+      <div style={{color:"#fff",fontSize:20,fontWeight:700,fontFamily:DISPLAY,marginBottom:2}}>
+        Hi {currentUser.name.split(" ")[0]} 🗑
+      </div>
+      <div style={{color:"rgba(255,255,255,0.7)",fontSize:13}}>
+        {myToday.length>0 ? `${myToday.length} job${myToday.length>1?"s":""} today`
+          : myUpcoming.length>0 ? `${myUpcoming.length} upcoming claimed job${myUpcoming.length>1?"s":""}`
+          : openJobs.length>0 ? `${openJobs.length} open job${openJobs.length>1?"s":""} available to claim`
+          : "No jobs scheduled"}
+      </div>
+    </div>
+
+    {/* Day-before reminder */}
+    {tomorrowJob&&!todayJob&&<div style={{background:"#FEF3C7",border:"1.5px solid #F59E0B",borderRadius:12,padding:"12px 16px",marginBottom:16,fontSize:13,fontWeight:600,color:"#92400E"}}>
+      ⏰ Reminder: You have a garbage job tomorrow at {properties.find(p=>p.id===tomorrowJob.propertyId)?.name||"a property"}.
+    </div>}
+
+    {/* Morning-of reminder */}
+    {todayJob&&<div style={{background:"#FEE2E2",border:"1.5px solid #EF4444",borderRadius:12,padding:"12px 16px",marginBottom:16,fontSize:13,fontWeight:600,color:"#991B1B"}}>
+      🚨 Today's job: {properties.find(p=>p.id===todayJob.propertyId)?.name||"a property"} — don't forget!
+    </div>}
+
+    {/* Open / available jobs */}
+    {openJobs.length>0&&<Section title="Available to Claim" count={openJobs.length} accent="#7C3AED">
+      <div style={{fontSize:12,color:COLORS.slate,marginBottom:10}}>First collector to claim gets the job. Once claimed it's yours only.</div>
+      {openJobs.sort((a,b)=>a.scheduledDate.localeCompare(b.scheduledDate)).map(j=><JobCard key={j.id} job={j} isOpen/>)}
+    </Section>}
+
+    {/* Today's claimed jobs */}
+    {myToday.length>0&&<Section title="Today" count={myToday.length} accent="#DC2626">
+      {myToday.map(j=><JobCard key={j.id} job={j} highlight/>)}
+    </Section>}
+
+    {/* Upcoming claimed jobs */}
+    {myUpcoming.length>0&&<Section title="My Upcoming Jobs" count={myUpcoming.length}>
+      {myUpcoming.map(j=><JobCard key={j.id} job={j}/>)}
+    </Section>}
+
+    {/* Empty state */}
+    {openJobs.length===0&&myActive.length===0&&<Card style={{textAlign:"center",padding:40}}>
+      <div style={{fontSize:40,marginBottom:12}}>🗑</div>
+      <div style={{fontWeight:700,fontSize:16,color:COLORS.navy,marginBottom:6}}>No jobs right now</div>
+      <div style={{fontSize:13,color:COLORS.slate}}>New jobs are auto-scheduled every Sunday for properties with recent bookings. You'll be notified when one is available.</div>
+    </Card>}
+
+    {/* Completed jobs */}
+    {myDone.length>0&&<div>
+      <button onClick={()=>setShowDone(v=>!v)}
+        style={{background:"none",border:`1.5px solid ${COLORS.border}`,borderRadius:10,padding:"10px 16px",
+                cursor:"pointer",fontFamily:FONT,fontSize:13,fontWeight:600,color:COLORS.slate,width:"100%",marginBottom:12}}>
+        {showDone?"▲ Hide":"▼ Show"} completed ({myDone.length})
+      </button>
+      {showDone&&myDone.map(j=><JobCard key={j.id} job={j}/>)}
+    </div>}
+  </div>;
+}
+
 // ─── SCHEDULE MANAGER VIEW (Landscape + Garbage manager interface) ────────────
 function ScheduleManagerView({jobs, jobType, accounts, properties, currentUser}) {
   const db = useContext(DbCtx);
   const [showNew, setShowNew]   = useState(false);
   const [filter,  setFilter]    = useState("all");
-  const [newJob,  setNewJob]    = useState({propertyId:"",scheduledDate:"",worker:"",notes:"",pickupType:""});
+  const [newJob,  setNewJob]    = useState({propertyId:"",scheduledDate:"",worker:"",notes:"",pickupType:"",windowStart:"",windowEnd:""});
 
   const dbPath    = jobType==="landscape" ? "landscapeJobs" : "garbageJobs";
   const icon      = jobType==="landscape" ? "🌿" : "🗑";
   const roleKey   = jobType==="landscape" ? "landscaper" : "garbage";
   const workers   = accounts.filter(a=>a.authorized&&a.role===roleKey).map(a=>a.name);
 
+  const filterOptions = jobType==="garbage"
+    ? ["all","open","pending","complete"]
+    : ["all","pending","complete"];
   const filtered  = filter==="all" ? jobs : jobs.filter(j=>j.status===filter);
   const sorted    = filtered.slice().sort((a,b)=>a.scheduledDate.localeCompare(b.scheduledDate));
 
@@ -1382,23 +1789,30 @@ function ScheduleManagerView({jobs, jobType, accounts, properties, currentUser})
     if (!newJob.propertyId||!newJob.scheduledDate) return;
     const id = String(Date.now());
     const now = new Date().toISOString();
+    // Garbage jobs start as "open" (collector claims them); landscape jobs start "pending"
+    const initialStatus = jobType==="garbage" ? "open" : "pending";
     await db.ref(`${dbPath}/${id}`).set({
       id, propertyId:newJob.propertyId, scheduledDate:newJob.scheduledDate,
-      worker:newJob.worker||null, status:"pending",
+      worker:newJob.worker||null, status:initialStatus,
       notes:newJob.notes||"", pickupType:newJob.pickupType||"",
+      windowStart:newJob.windowStart||"", windowEnd:newJob.windowEnd||"",
       createdAt:now, updatedAt:now,
     });
-    setShowNew(false); setNewJob({propertyId:"",scheduledDate:"",worker:"",notes:"",pickupType:""});
+    if (jobType==="garbage") {
+      await db.ref(`garbageNotifications/${id}`).set({jobId:id, propertyId:newJob.propertyId, scheduledDate:newJob.scheduledDate, createdAt:now});
+    }
+    setShowNew(false); setNewJob({propertyId:"",scheduledDate:"",worker:"",notes:"",pickupType:"",windowStart:"",windowEnd:""});
   };
 
   const removeJob = async id => { if (window.confirm("Remove this job?")) await db.ref(`${dbPath}/${id}`).remove(); };
   const assignWorker = async (id, worker) => { await db.ref(`${dbPath}/${id}`).update({worker:worker||null,updatedAt:new Date().toISOString()}); };
+  const assignWindow = async (id, windowStart, windowEnd) => { await db.ref(`${dbPath}/${id}`).update({windowStart:windowStart||"",windowEnd:windowEnd||"",updatedAt:new Date().toISOString()}); };
 
   return <div>
     <div style={{display:"flex",gap:8,marginBottom:20,flexWrap:"wrap",alignItems:"center"}}>
-      {["all","pending","complete"].map(f=>(
+      {filterOptions.map(f=>(
         <button key={f} onClick={()=>setFilter(f)} style={{padding:"6px 14px",borderRadius:20,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:12,fontWeight:600,background:filter===f?COLORS.blue:COLORS.sky,color:filter===f?"#fff":COLORS.slate}}>
-          {f==="all"?"All":f==="pending"?"Pending":"Completed"}
+          {f==="all"?"All":f==="open"?"Open (Unclaimed)":f==="pending"?"Pending":"Completed"}
         </button>
       ))}
       <div style={{flex:1}}/>
@@ -1421,14 +1835,28 @@ function ScheduleManagerView({jobs, jobType, accounts, properties, currentUser})
           <input type="date" value={newJob.scheduledDate} onChange={e=>setNewJob(v=>({...v,scheduledDate:e.target.value}))}
             style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}/>
         </div>
-        <div>
+        {jobType!=="garbage"&&<div>
           <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Assign to</label>
           <select value={newJob.worker} onChange={e=>setNewJob(v=>({...v,worker:e.target.value}))}
             style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}>
             <option value="">Unassigned</option>
             {workers.map(w=><option key={w} value={w}>{w}</option>)}
           </select>
-        </div>
+        </div>}
+        {jobType==="landscape"&&<div>
+          <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Completion Window (optional)</label>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <input type="time" value={newJob.windowStart} onChange={e=>setNewJob(v=>({...v,windowStart:e.target.value}))}
+              style={{flex:1,padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}/>
+            <span style={{color:COLORS.slate,fontSize:13,flexShrink:0}}>to</span>
+            <input type="time" value={newJob.windowEnd} onChange={e=>setNewJob(v=>({...v,windowEnd:e.target.value}))}
+              style={{flex:1,padding:"9px 12px",borderRadius:8,border:`1.5px solid ${COLORS.border}`,fontSize:13}}/>
+          </div>
+          <div style={{fontSize:11,color:COLORS.slate,marginTop:4}}>Set a time window when the job must be completed</div>
+        </div>}
+        {jobType==="garbage"&&<div style={{background:COLORS.sky,borderRadius:8,padding:"10px 14px",fontSize:12,color:COLORS.slate}}>
+          🗑 Job will be posted as open — collectors claim it themselves via their dashboard.
+        </div>}
         {jobType==="garbage"&&<div>
           <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:4}}>Pickup Type</label>
           <select value={newJob.pickupType} onChange={e=>setNewJob(v=>({...v,pickupType:e.target.value}))}
@@ -1460,21 +1888,41 @@ function ScheduleManagerView({jobs, jobType, accounts, properties, currentUser})
         const prop = properties.find(p=>p.id===job.propertyId)||{name:"Unknown",color:"#94A3B8"};
         const dateLabel = new Date(...job.scheduledDate.split("-").map((v,i)=>i===1?v-1:Number(v)))
           .toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric",year:"numeric"});
+        const statusBadgeCfg = job.status==="complete"
+          ? {label:"Complete",bg:"#D1FAE5",color:"#065F46"}
+          : job.status==="open"
+          ? {label:"Open — Unclaimed",bg:"#EDE9FE",color:"#6D28D9"}
+          : {label:"Pending",bg:"#FEF3C7",color:"#92400E"};
+        const isGarbageOpen = jobType==="garbage" && job.status==="open";
         return <Card key={job.id} style={{padding:"14px 18px"}}>
           <div style={{display:"flex",alignItems:"center",gap:12}}>
             <div style={{width:8,height:40,borderRadius:4,background:prop.color,flexShrink:0}}/>
             <div style={{flex:1}}>
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
                 <span style={{fontWeight:700,fontSize:14,color:COLORS.navy}}>{prop.name}</span>
-                <Badge config={job.status==="complete"?{label:"Complete",bg:"#D1FAE5",color:"#065F46"}:{label:"Pending",bg:"#FEF3C7",color:"#92400E"}} small/>
+                <Badge config={statusBadgeCfg} small/>
                 {job.pickupType&&<span style={{fontSize:11,color:COLORS.slate}}>{job.pickupType}</span>}
+                {job.autoScheduled&&<span style={{fontSize:10,color:COLORS.slate,background:COLORS.sky,padding:"1px 6px",borderRadius:10}}>auto</span>}
               </div>
               <div style={{fontSize:12,color:COLORS.slate,marginBottom:6}}>{dateLabel}{job.notes?` · ${job.notes}`:""}</div>
-              <select value={job.worker||""} onChange={e=>assignWorker(job.id,e.target.value)}
-                style={{fontSize:12,padding:"4px 8px",borderRadius:6,border:`1px solid ${COLORS.border}`,background:"#fff"}}>
-                <option value="">Unassigned</option>
-                {workers.map(w=><option key={w} value={w}>{w}</option>)}
-              </select>
+              {isGarbageOpen
+                ? <div style={{fontSize:11,color:"#6D28D9",fontStyle:"italic"}}>Awaiting a collector to claim</div>
+                : <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                    <select value={job.worker||""} onChange={e=>assignWorker(job.id,e.target.value)}
+                      style={{fontSize:12,color:COLORS.slate,border:`1px solid ${COLORS.border}`,borderRadius:6,padding:"3px 6px",background:"#fff",cursor:"pointer",width:"fit-content"}}>
+                      <option value="">Unassigned</option>
+                      {workers.map(w=><option key={w} value={w}>{w}</option>)}
+                    </select>
+                    {jobType==="landscape"&&<div style={{display:"flex",alignItems:"center",gap:4}}>
+                      <span style={{fontSize:11,color:COLORS.slate,flexShrink:0}}>⏰</span>
+                      <input type="time" defaultValue={job.windowStart||""} onBlur={e=>assignWindow(job.id,e.target.value,job.windowEnd||"")}
+                        style={{fontSize:11,border:`1px solid ${COLORS.border}`,borderRadius:5,padding:"2px 5px",width:90}}/>
+                      <span style={{fontSize:11,color:COLORS.slate}}>–</span>
+                      <input type="time" defaultValue={job.windowEnd||""} onBlur={e=>assignWindow(job.id,job.windowStart||"",e.target.value)}
+                        style={{fontSize:11,border:`1px solid ${COLORS.border}`,borderRadius:5,padding:"2px 5px",width:90}}/>
+                    </div>}
+                  </div>
+              }
             </div>
             <button onClick={()=>removeJob(job.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:16,color:COLORS.slate,padding:4}}>🗑</button>
           </div>
@@ -1487,9 +1935,10 @@ function ScheduleManagerView({jobs, jobType, accounts, properties, currentUser})
 // ─── OPERATIONS CALENDAR ─────────────────────────────────────────────────────
 function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
   const db = useContext(DbCtx);
-  const [photos,setPhotos]   = useState([]);
-  const [liveJob,setLiveJob] = useState(detail.job||null);
-  const [lightbox,setLightbox] = useState(null);
+  const [photos,setPhotos]         = useState([]);
+  const [liveJob,setLiveJob]       = useState(detail.job||null);
+  const [lightbox,setLightbox]     = useState(null);
+  const [clChecklistCount, setClChecklistCount] = useState(0);
   const cleaners = (accounts||[]).filter(a=>a.role==="cleaner").map(a=>a.name);
 
   useEffect(()=>{
@@ -1600,8 +2049,17 @@ function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
             <Btn variant="ghost" small onClick={()=>assignCleaner(null)}
               style={{width:"100%",justifyContent:"center"}}>Unclaim</Btn>
           </>}
-          {liveJob.status==="in-progress"&&<Btn variant="green" small onClick={()=>updateJobStatus("complete")}
-            style={{width:"100%",justifyContent:"center",marginBottom:6}}>✓ Mark Complete</Btn>}
+          {liveJob.status==="in-progress"&&<>
+            <ChecklistPanel jobId={liveJob.id} readOnly={false} onProgress={c=>setClChecklistCount(c)}/>
+            <Btn variant="green" small
+              onClick={()=>clChecklistCount>=CHECKLIST_TOTAL&&updateJobStatus("complete")}
+              disabled={clChecklistCount<CHECKLIST_TOTAL}
+              style={{width:"100%",justifyContent:"center",marginTop:10,
+                      opacity:clChecklistCount>=CHECKLIST_TOTAL?1:0.6,
+                      cursor:clChecklistCount>=CHECKLIST_TOTAL?"pointer":"not-allowed"}}>
+              {clChecklistCount>=CHECKLIST_TOTAL?"✓ Mark Complete":`Checklist: ${clChecklistCount}/${CHECKLIST_TOTAL}`}
+            </Btn>
+          </>}
         </>}
       </div>}
 
@@ -1616,6 +2074,8 @@ function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
           style={{width:"100%",justifyContent:"center",marginBottom:6}}>🕐 Mark In Progress</Btn>}
         {liveJob.status==="in-progress"&&<Btn variant="green" small onClick={()=>updateJobStatus("complete")}
           style={{width:"100%",justifyContent:"center"}}>✓ Mark Complete</Btn>}
+        {(liveJob.status==="in-progress"||liveJob.status==="complete")&&
+          <ChecklistPanel jobId={liveJob.id} readOnly={true} defaultCollapsed={true}/>}
       </div>}
 
       {/* Photo upload */}
@@ -1665,6 +2125,92 @@ function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
   </Modal>;
 }
 
+// ─── LANDSCAPER CALENDAR VIEW ────────────────────────────────────────────────
+function LandscaperCalendarView({jobs, properties}) {
+  const calRef = useRef(null);
+  const fcRef  = useRef(null);
+  const [detail, setDetail] = useState(null);
+
+  const fcEndDate = dateStr => {
+    const [y,m,d] = dateStr.split("-").map(Number);
+    const dt = new Date(y,m-1,d+1);
+    return dt.getFullYear()+"-"+String(dt.getMonth()+1).padStart(2,"0")+"-"+String(dt.getDate()).padStart(2,"0");
+  };
+
+  const buildEvents = jobsArr => jobsArr.map(job => {
+    const prop = properties.find(p=>p.id===job.propertyId)||{name:"Unknown",color:"#059669"};
+    const timeLabel = job.windowStart ? ` · ${fmtTime(job.windowStart)}${job.windowEnd?" – "+fmtTime(job.windowEnd):""}` : "";
+    return {
+      id: job.id,
+      start: job.scheduledDate,
+      end: fcEndDate(job.scheduledDate),
+      allDay: true,
+      title: prop.name + timeLabel,
+      backgroundColor: job.status==="complete" ? "#6EE7B7" : prop.color||"#059669",
+      borderColor:     job.status==="complete" ? "#059669" : prop.color||"#059669",
+      extendedProps: {job, prop},
+    };
+  });
+
+  useEffect(()=>{
+    if (!calRef.current||typeof FullCalendar==='undefined') return;
+    const cal = new FullCalendar.Calendar(calRef.current,{
+      initialView:'dayGridMonth',
+      headerToolbar:{left:'prev,next today',center:'title',right:'dayGridMonth,listWeek'},
+      buttonText:{today:'Today',month:'Month',list:'Agenda'},
+      fixedWeekCount:false, dayMaxEvents:4, height:'auto',
+      eventContent: arg=>{
+        const ep = arg.event.extendedProps;
+        const wrap = document.createElement('div');
+        wrap.style.cssText='display:flex;align-items:center;gap:3px;padding:1px 5px;overflow:hidden;width:100%;min-width:0';
+        const dot = document.createElement('span');
+        dot.textContent = ep.job.status==='complete'?'✅':'🌿';
+        dot.style.cssText='font-size:9px;flex-shrink:0;line-height:1';
+        const t = document.createElement('span');
+        t.textContent = ep.prop.name;
+        t.style.cssText='font-size:11px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;line-height:1.5';
+        wrap.appendChild(dot); wrap.appendChild(t);
+        return {domNodes:[wrap]};
+      },
+      eventClick: info=>setDetail(info.event.extendedProps),
+    });
+    fcRef.current = cal;
+    cal.render();
+    return ()=>cal.destroy();
+  },[]);
+
+  useEffect(()=>{
+    if (!fcRef.current) return;
+    fcRef.current.setOption('events', buildEvents(jobs));
+  },[jobs, properties]);
+
+  return <div style={{paddingBottom:40}}>
+    {detail&&<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}
+        onClick={()=>setDetail(null)}>
+      <div style={{background:"#fff",borderRadius:16,padding:24,maxWidth:400,width:"100%",boxShadow:"0 8px 40px rgba(0,0,0,0.2)"}} onClick={e=>e.stopPropagation()}>
+        <div style={{height:4,background:detail.prop.color||"#059669",borderRadius:2,marginBottom:16}}/>
+        <div style={{fontWeight:700,fontSize:18,color:COLORS.navy,marginBottom:4}}>{detail.prop.name}</div>
+        {detail.prop.address&&<div style={{fontSize:13,color:COLORS.slate,marginBottom:12}}>{detail.prop.address}</div>}
+        <div style={{fontSize:13,color:COLORS.slate,marginBottom:8}}>📅 {new Date(...detail.job.scheduledDate.split("-").map((v,i)=>i===1?v-1:Number(v))).toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"})}</div>
+        {(detail.job.windowStart||detail.job.windowEnd)&&<div style={{display:"flex",alignItems:"center",gap:6,background:"#ECFDF5",border:"1px solid #6EE7B7",borderRadius:8,padding:"8px 12px",marginBottom:8}}>
+          <span>⏰</span>
+          <span style={{fontSize:13,fontWeight:600,color:"#065F46"}}>Complete between {detail.job.windowStart&&fmtTime(detail.job.windowStart)}{detail.job.windowStart&&detail.job.windowEnd?" – ":""}{detail.job.windowEnd&&fmtTime(detail.job.windowEnd)}</span>
+        </div>}
+        {detail.job.notes&&<div style={{fontSize:13,color:COLORS.slate,background:COLORS.surface,padding:"8px 12px",borderRadius:8,marginBottom:8}}>📝 {detail.job.notes}</div>}
+        <div style={{marginTop:8}}>
+          <span style={{fontSize:12,fontWeight:700,padding:"3px 10px",borderRadius:20,
+            background:detail.job.status==="complete"?"#D1FAE5":detail.job.status==="pending"?"#FEF3C7":"#EFF6FF",
+            color:detail.job.status==="complete"?"#065F46":detail.job.status==="pending"?"#92400E":"#1D4ED8"}}>
+            {detail.job.status==="complete"?"✅ Completed":detail.job.status==="pending"?"⏳ Pending":"In Progress"}
+          </span>
+        </div>
+        <button onClick={()=>setDetail(null)} style={{marginTop:16,width:"100%",padding:"10px",borderRadius:10,border:"none",background:COLORS.surface,cursor:"pointer",fontFamily:FONT,fontSize:14,fontWeight:600,color:COLORS.slate}}>Close</button>
+      </div>
+    </div>}
+    <div ref={calRef}/>
+  </div>;
+}
+
 function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
   const calRef  = useRef(null);
   const fcRef   = useRef(null);
@@ -1682,6 +2228,7 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
 
   const buildEvents = (staysArr,propsArr,jobsArr,hiddenSet) => {
     const turnovers = getTurnovers(staysArr);
+<<<<<<< Updated upstream
     return staysArr.filter(s=>!hiddenSet.has(s.propId)).map(s=>{
       const prop = propsArr.find(p=>p.id===s.propId);
       if (!prop) return null;
@@ -1694,6 +2241,68 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
         extendedProps: {stay:s,prop,job,isTurnover},
       };
     }).filter(Boolean);
+=======
+
+    // Build a map of turnover dates: "propId_date" -> {checkoutStay, checkinStay, date, propId}
+    const splitMap = {};
+    staysArr.forEach(s=>{
+      if (turnovers.has(`${s.propId}_${s.end}`)) {
+        const k=`${s.propId}_${s.end}`;
+        if (!splitMap[k]) splitMap[k]={propId:s.propId,date:s.end};
+        splitMap[k].checkoutStay=s;
+      }
+      if (turnovers.has(`${s.propId}_${s.start}`)) {
+        const k=`${s.propId}_${s.start}`;
+        if (!splitMap[k]) splitMap[k]={propId:s.propId,date:s.start};
+        splitMap[k].checkinStay=s;
+      }
+    });
+
+    const events=[];
+
+    // Main booking bars — skip the turnover date on each end so the split event owns it
+    staysArr.filter(s=>!hiddenSet.has(s.propId)).forEach(s=>{
+      const prop=propsArr.find(p=>p.id===s.propId);
+      if (!prop) return;
+      const job=jobsArr.find(j=>j.propertyId===s.propId&&j.checkoutDate===s.end);
+      const isCheckoutTurnover=turnovers.has(`${s.propId}_${s.end}`);
+      const isCheckinTurnover =turnovers.has(`${s.propId}_${s.start}`);
+      // Outgoing: end bar before the turnover date; Incoming: start bar after it
+      const startDate=isCheckinTurnover  ? fcEndDate(s.start) : s.start;
+      const endDate  =isCheckoutTurnover ? s.end              : fcEndDate(s.end);
+      if (startDate>=endDate) return; // 1-night stay fully covered by split events
+      events.push({
+        id:s.uid, start:startDate, end:endDate, allDay:true, title:prop.name,
+        backgroundColor:prop.color, borderColor:prop.color,
+        classNames:[],
+        extendedProps:{stay:s,prop,job,isTurnover:false},
+      });
+    });
+
+    // Split turnover event — one per same-day turnover, renders as a half-and-half bar
+    Object.values(splitMap).filter(se=>!hiddenSet.has(se.propId)).forEach(se=>{
+      if (!se.checkoutStay||!se.checkinStay) return;
+      const checkoutProp=propsArr.find(p=>p.id===se.checkoutStay.propId);
+      const checkinProp =propsArr.find(p=>p.id===se.checkinStay.propId);
+      if (!checkoutProp||!checkinProp) return;
+      const job=jobsArr.find(j=>j.propertyId===se.propId&&j.checkoutDate===se.date);
+      events.push({
+        id:`split_${se.propId}_${se.date}`,
+        start:se.date, end:fcEndDate(se.date), allDay:true,
+        title:checkoutProp.name,
+        backgroundColor:'transparent', borderColor:'transparent',
+        classNames:['fc-ev-split-turnover'],
+        extendedProps:{
+          isSplitTurnover:true,
+          checkoutStay:se.checkoutStay, checkinStay:se.checkinStay,
+          checkoutProp, checkinProp, job,
+          stay:se.checkoutStay, prop:checkoutProp, isTurnover:false,
+        },
+      });
+    });
+
+    return events;
+>>>>>>> Stashed changes
   };
 
   // Init FullCalendar once
@@ -1705,7 +2314,28 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
       buttonText:{today:'Today',month:'Month',week:'Week',list:'Agenda'},
       fixedWeekCount:false, dayMaxEvents:4, height:'auto',
       eventContent: arg=>{
-        const {isTurnover}=arg.event.extendedProps;
+        const ep=arg.event.extendedProps;
+        if (ep.isSplitTurnover) {
+          const wrap=document.createElement('div');
+          wrap.style.cssText='display:flex;width:100%;height:100%;overflow:hidden;border-radius:3px;';
+          const left=document.createElement('div');
+          left.style.cssText=`flex:1;background:${ep.checkoutProp.color};padding:1px 4px;overflow:hidden;display:flex;align-items:center;min-width:0;`;
+          const lt=document.createElement('span');
+          lt.textContent=ep.checkoutProp.name;
+          lt.style.cssText='font-size:11px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;line-height:1.5';
+          left.appendChild(lt);
+          const div=document.createElement('div');
+          div.style.cssText='width:2px;background:#F97316;flex-shrink:0;';
+          const right=document.createElement('div');
+          right.style.cssText=`flex:1;background:${ep.checkinProp.color};padding:1px 4px;overflow:hidden;display:flex;align-items:center;min-width:0;`;
+          const rt=document.createElement('span');
+          rt.textContent=ep.checkinProp.name;
+          rt.style.cssText='font-size:11px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;line-height:1.5';
+          right.appendChild(rt);
+          wrap.appendChild(left); wrap.appendChild(div); wrap.appendChild(right);
+          return {domNodes:[wrap]};
+        }
+        const {isTurnover}=ep;
         const wrap=document.createElement('div');
         wrap.style.cssText='display:flex;align-items:center;gap:3px;padding:1px 5px;overflow:hidden;width:100%;min-width:0';
         if(isTurnover){const b=document.createElement('span');b.textContent='⚡';b.style.cssText='font-size:9px;flex-shrink:0;line-height:1';wrap.appendChild(b);}
@@ -1717,9 +2347,17 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
       },
       eventClick: info=>setDetail(info.event.extendedProps),
       eventDidMount: arg=>{
-        if(arg.event.extendedProps.isTurnover){arg.el.style.borderLeft='3px solid #F97316';}
-        // Tooltip with checkin/checkout times
-        const {prop,stay}=arg.event.extendedProps;
+        const ep=arg.event.extendedProps;
+        if (ep.isSplitTurnover) {
+          arg.el.style.background='transparent';
+          arg.el.style.border='none';
+          arg.el.style.padding='0';
+          const {checkoutProp,checkinProp,checkoutStay,checkinStay}=ep;
+          arg.el.title=`Turnover: ${checkoutProp.name} → ${checkinProp.name}\nCheckout: ${checkoutStay.end} at ${checkoutProp.checkoutTime||'11:00 AM'}\nCheck-in: ${checkinStay.start} at ${checkinProp.checkinTime||'3:00 PM'}`;
+          return;
+        }
+        if(ep.isTurnover){arg.el.style.borderLeft='3px solid #F97316';}
+        const {prop,stay}=ep;
         arg.el.title=`${prop.name}\nCheck-in: ${stay.start} at ${prop.checkinTime||'3:00 PM'}\nCheckout: ${stay.end} at ${prop.checkoutTime||'11:00 AM'}\n${stay.nights} nights`;
       },
     });
@@ -1756,8 +2394,12 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
           ))}
           {properties.length>10&&<span style={{fontSize:11,color:COLORS.slate}}>+{properties.length-10} more</span>}
           <div style={{display:"flex",alignItems:"center",gap:5,marginLeft:"auto",flexShrink:0}}>
-            <div style={{width:20,height:12,borderRadius:3,background:"#1B4FD8",borderLeft:"3px solid #F97316",flexShrink:0}}/>
-            <span style={{fontSize:11,color:COLORS.slate,whiteSpace:"nowrap"}}>⚡ Same-day turnover</span>
+            <div style={{width:20,height:12,borderRadius:3,overflow:"hidden",display:"flex",flexShrink:0}}>
+              <div style={{flex:1,background:"#1B4FD8"}}/>
+              <div style={{width:2,background:"#F97316"}}/>
+              <div style={{flex:1,background:"#1B4FD8"}}/>
+            </div>
+            <span style={{fontSize:11,color:COLORS.slate,whiteSpace:"nowrap"}}>Same-day turnover</span>
           </div>
         </div>}
       </div>
@@ -1782,8 +2424,12 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
         <div style={{marginTop:14,paddingTop:12,borderTop:`1px solid ${COLORS.border}`,display:"flex",gap:16,flexWrap:"wrap",alignItems:"center"}}>
           <span style={{fontSize:12,fontWeight:700,color:COLORS.slate}}>Legend</span>
           <div style={{display:"flex",alignItems:"center",gap:6}}>
-            <div style={{width:22,height:13,borderRadius:3,background:"#1B4FD8",borderLeft:"3px solid #F97316"}}/>
-            <span style={{fontSize:11,color:COLORS.slate}}>⚡ Same-day turnover — urgent clean window</span>
+            <div style={{width:22,height:13,borderRadius:3,overflow:"hidden",display:"flex"}}>
+              <div style={{flex:1,background:"#1B4FD8"}}/>
+              <div style={{width:2,background:"#F97316"}}/>
+              <div style={{flex:1,background:"#1B4FD8"}}/>
+            </div>
+            <span style={{fontSize:11,color:COLORS.slate}}>Same-day turnover — split bar (checkout | check-in)</span>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:6}}>
             <div style={{width:22,height:13,borderRadius:3,background:"#1B4FD8"}}/>
@@ -1837,9 +2483,13 @@ function SubmitMaintenanceModal({onClose,properties,currentUser,maintenance}) {
   const addPhoto = async e => {
     const files = Array.from(e.target.files||[]);
     if (photos.length+files.length>5){setErr("Maximum 5 photos.");return;}
-    setUploading(true);
-    const compressed = await Promise.all(files.map(f=>compressImage(f)));
-    setPhotos(p=>[...p,...compressed.map((dataUrl,i)=>({id:String(Date.now())+i,dataUrl}))]);
+    setUploading(true); setErr("");
+    try {
+      const compressed = await Promise.all(files.map(f=>compressImage(f)));
+      setPhotos(p=>[...p,...compressed.map((dataUrl,i)=>({id:String(Date.now())+i,dataUrl}))]);
+    } catch(err) {
+      setErr("Could not load photo. Try a JPEG or PNG file. " + err.message);
+    }
     setUploading(false); e.target.value="";
   };
 
@@ -1852,12 +2502,17 @@ function SubmitMaintenanceModal({onClose,properties,currentUser,maintenance}) {
     const id = String(Date.now());
     const photoObj = {}; photos.forEach(p=>{photoObj[p.id]=p;});
     const now = new Date().toISOString();
-    await db.ref(`maintenance/${id}`).set({
-      id,propertyId:propId,category:cat,title:title.trim(),description:desc.trim(),
-      urgency,status:"open",submittedBy:currentUser.name,submittedById:currentUser.id,
-      submittedAt:now,updatedAt:now,photos:photoObj,note:"",noteBy:"",noteAt:""
-    });
-    onClose();
+    try {
+      await db.ref(`maintenance/${id}`).set({
+        id,propertyId:propId,category:cat,title:title.trim(),description:desc.trim(),
+        urgency,status:"open",submittedBy:currentUser.name,submittedById:currentUser.id,
+        submittedAt:now,updatedAt:now,photos:photoObj,note:"",noteBy:"",noteAt:""
+      });
+      onClose();
+    } catch(err) {
+      setErr("Failed to submit: " + err.message);
+      setSaving(false);
+    }
   };
 
   return <Modal onClose={onClose} wide>
@@ -2192,6 +2847,62 @@ function MaintenanceView({maintenance,properties,currentUser}) {
 }
 
 // ─── APP ──────────────────────────────────────────────────────────────────────
+// ─── GARBAGE AUTO-SCHEDULER ──────────────────────────────────────────────────
+// Runs on Sunday: for each property with ≥1 booking in the past 7 days,
+// create an "open" garbage job (unclaimed) if one doesn't exist yet.
+async function runGarbageAutoScheduler(db, properties, stays) {
+  const now = new Date();
+  const todayStr = now.toISOString().slice(0, 10);
+
+  // Guard: don't run more than once per week (7-day window)
+  const lastRunSnap = await db.ref("autoScheduler/garbageLastRun").once("value");
+  const lastRun = lastRunSnap.val();
+  if (lastRun) {
+    const daysSinceLast = (now - new Date(lastRun)) / 86400000;
+    if (daysSinceLast < 7) return [];
+  }
+
+  // Always schedule for the upcoming Sunday (or today if it is Sunday)
+  const daysUntilSunday = (7 - now.getDay()) % 7;
+  const sunday = new Date(now);
+  sunday.setDate(now.getDate() + daysUntilSunday);
+  const sundayStr = sunday.toISOString().slice(0, 10);
+
+  // Window: past 7 days of bookings
+  const weekAgo = new Date(now);
+  weekAgo.setDate(weekAgo.getDate() - 7);
+  const weekAgoStr = weekAgo.toISOString().slice(0, 10);
+
+  // Find existing garbage jobs for that Sunday to avoid duplicates
+  const existingSnap = await db.ref("garbageJobs").orderByChild("scheduledDate").equalTo(sundayStr).once("value");
+  const existingPropIds = new Set(Object.values(existingSnap.val() || {}).map(j => j.propertyId));
+
+  const createdIds = [];
+  for (const prop of properties) {
+    if (existingPropIds.has(prop.id)) continue;
+    // Check if property had any booking in the past 7 days
+    const hadBooking = stays.some(s => s.propId === prop.id && s.start < todayStr && s.end > weekAgoStr);
+    if (!hadBooking) continue;
+
+    const id = `gc_auto_${prop.id}_${sundayStr}`;
+    const now2 = new Date().toISOString();
+    await db.ref(`garbageJobs/${id}`).set({
+      id, propertyId: prop.id, scheduledDate: sundayStr,
+      worker: null, status: "open",
+      notes: "", pickupType: "",
+      createdAt: now2, updatedAt: now2,
+      autoScheduled: true,
+    });
+    await db.ref(`garbageNotifications/${id}`).set({
+      jobId: id, propertyId: prop.id, scheduledDate: sundayStr, createdAt: now2,
+    });
+    createdIds.push(id);
+  }
+
+  await db.ref("autoScheduler/garbageLastRun").set(todayStr);
+  return createdIds;
+}
+
 // ─── FCM PUSH REGISTRATION ───────────────────────────────────────────────────
 // Replace VAPID_KEY_HERE with the key from:
 // Firebase Console → Project Settings → Cloud Messaging → Web configuration → Generate key pair
@@ -2229,6 +2940,7 @@ function App() {
   const [toast,          setToast]        = useState(null);
   const [online,       setOnline]     = useState(true);
   const seenMaintIds = React.useRef(new Set());
+  const autoSchedulerRan = React.useRef(false);
 
   // Monitor connection state
   useEffect(() => {
@@ -2293,6 +3005,20 @@ function App() {
     return () => Object.values(r).forEach(ref=>ref.off());
   }, [db]);
 
+  // Auto-scheduler: runs once per Sunday for managers/owners after data loads
+  useEffect(() => {
+    if (!currentUser || !["owner","manager"].includes(currentUser.role)) return;
+    if (properties.length === 0 || stays.length === 0) return;
+    if (autoSchedulerRan.current) return;
+    autoSchedulerRan.current = true;
+    runGarbageAutoScheduler(db, properties, stays).then(ids => {
+      if (ids.length > 0) {
+        setToast({msg:`🗑 Auto-scheduled ${ids.length} garbage job${ids.length>1?"s":""} for today — open for collectors to claim.`, urgent:false});
+        setTimeout(()=>setToast(null), 7000);
+      }
+    }).catch(e => console.warn("Garbage auto-scheduler error:", e));
+  }, [currentUser, properties, stays]);
+
   // Sync currentUser with live accounts (e.g. authorized status changed)
   useEffect(() => {
     if (!currentUser) return;
@@ -2330,12 +3056,13 @@ function App() {
 
   const myJobsBadge      = isCleaner    ? jobs.filter(j=>j.cleaner===currentUser.name&&j.status!=="complete").length : 0;
   const landscapeBadge   = isLandscaper ? landscapeJobs.filter(j=>j.worker===currentUser.name&&j.status!=="complete").length : 0;
-  const garbageBadge     = isGarbage    ? garbageJobs.filter(j=>j.worker===currentUser.name&&j.status!=="complete").length : 0;
+  const garbageBadge     = isGarbage    ? garbageJobs.filter(j=>(j.worker===currentUser.name||j.status==="open")&&j.status!=="complete").length : 0;
 
   const changeSection = s => { setSection(s); setTab("dashboard"); };
 
   const tabs = isLandscaper ? [
-    {id:"myjobs", label:"My Jobs", icon:"🌿", badge:landscapeBadge},
+    {id:"myjobs",    label:"My Jobs",  icon:"🌿", badge:landscapeBadge},
+    {id:"lscalendar",label:"Calendar", icon:"📅"},
   ] : isGarbage ? [
     {id:"myjobs", label:"My Jobs", icon:"🗑", badge:garbageBadge},
   ] : isCleaner ? [
@@ -2445,8 +3172,9 @@ function App() {
         </div>}
         <Tabs tabs={tabs} active={tab} onChange={setTab}/>
         {tab==="myjobs"     &&isCleaner   &&<MyJobsView jobs={jobs} properties={properties} currentUser={currentUser}/>}
-        {tab==="myjobs"     &&isLandscaper&&<WorkerScheduleView jobs={landscapeJobs.filter(j=>j.worker===currentUser.name)} jobType="landscape" currentUser={currentUser} properties={properties}/>}
-        {tab==="myjobs"     &&isGarbage   &&<WorkerScheduleView jobs={garbageJobs.filter(j=>j.worker===currentUser.name)} jobType="garbage" currentUser={currentUser} properties={properties}/>}
+        {tab==="myjobs"      &&isLandscaper&&<WorkerScheduleView jobs={landscapeJobs.filter(j=>j.worker===currentUser.name)} jobType="landscape" currentUser={currentUser} properties={properties}/>}
+        {tab==="lscalendar"  &&isLandscaper&&<LandscaperCalendarView jobs={landscapeJobs.filter(j=>j.worker===currentUser.name)} properties={properties}/>}
+        {tab==="myjobs"     &&isGarbage   &&<GarbageWorkerView allGarbageJobs={garbageJobs} currentUser={currentUser} properties={properties}/>}
         {tab==="dashboard"  &&!isWorker&&<DashboardView jobs={jobs} inventory={inventory} properties={properties} currentUser={currentUser} stays={stays} maintenance={maintenance}/>}
         {tab==="calendar"  &&<OpsCalendarView stays={stays} properties={properties} jobs={jobs} currentUser={currentUser} accounts={accounts}/>}
         {tab==="sync"      &&!isWorker&&<CalendarView stays={stays} jobs={jobs} properties={properties} accounts={accounts} currentUser={currentUser} readOnly={false}/>}
@@ -2466,6 +3194,7 @@ function JobsView({jobs,properties,accounts,currentUser}) {
   const db = useContext(DbCtx);
   const [filter,setFilter]=useState("all");
   const [showModal,setShowModal]=useState(null);
+  const [confirmDelete,setConfirmDelete]=useState(false);
   const [showNew,setShowNew]=useState(false);
   const [newJob,setNewJob]=useState({propertyId:"",checkoutDate:"",checkinDate:"",cleaner:""});
   const cleaners = accounts.filter(a=>a.authorized&&(a.role==="cleaner"||a.role==="manager"||a.role==="owner")).map(a=>a.name);
@@ -2480,6 +3209,13 @@ function JobsView({jobs,properties,accounts,currentUser}) {
   };
   const assignCleaner = async (jobId,cleaner) => {
     await db.ref(`jobs/${jobId}`).update({cleaner:cleaner||null});
+  };
+  const deleteJob = async (jobId) => {
+    await Promise.all([
+      db.ref(`jobs/${jobId}`).remove(),
+      db.ref(`jobPhotos/${jobId}`).remove(),
+    ]);
+    setShowModal(null); setConfirmDelete(false);
   };
   const addJob = async () => {
     if (!newJob.propertyId||!newJob.checkoutDate) return;
@@ -2526,7 +3262,7 @@ function JobsView({jobs,properties,accounts,currentUser}) {
       })}
     </div>}
 
-    {showModal&&<Modal onClose={()=>setShowModal(null)}>
+    {showModal&&<Modal onClose={()=>{setShowModal(null);setConfirmDelete(false);}}>
       <div>
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
           <div style={{width:14,height:14,borderRadius:"50%",background:getProp(showModal.propertyId,properties).color}}/>
@@ -2545,8 +3281,24 @@ function JobsView({jobs,properties,accounts,currentUser}) {
           <div style={{fontSize:11,color:COLORS.slate,marginBottom:2}}>Assigned Cleaner</div>
           <div style={{fontSize:13,fontWeight:600,color:showModal.cleaner?COLORS.navy:COLORS.slate}}>{showModal.cleaner||"Unassigned — waiting for a cleaner to claim"}</div>
         </div>
+        {(showModal.status==="in-progress"||showModal.status==="complete")&&
+          <div style={{marginBottom:14}}>
+            <ChecklistPanel jobId={showModal.id} readOnly={true} defaultCollapsed={true}/>
+          </div>}
         {showModal.status==="pending"&&<Btn variant="amber" onClick={()=>updateStatus(showModal.id,"in-progress")} style={{width:"100%",justifyContent:"center",marginBottom:8}}>🕐 Mark In Progress</Btn>}
         {showModal.status==="in-progress"&&<Btn variant="green" onClick={()=>updateStatus(showModal.id,"complete")} style={{width:"100%",justifyContent:"center",marginBottom:8}}>✓ Mark Complete</Btn>}
+        <div style={{borderTop:`1px solid ${COLORS.border}`,marginTop:12,paddingTop:12}}>
+          {!confirmDelete
+            ?<Btn variant="ghost" onClick={()=>setConfirmDelete(true)} style={{width:"100%",justifyContent:"center",color:"#DC2626"}}>Delete Job</Btn>
+            :<div style={{background:"#FEF2F2",borderRadius:10,padding:"12px 16px",display:"flex",flexDirection:"column",gap:8}}>
+              <div style={{fontSize:13,fontWeight:600,color:"#DC2626",textAlign:"center"}}>Delete this job permanently?</div>
+              <div style={{display:"flex",gap:8}}>
+                <Btn variant="ghost" onClick={()=>setConfirmDelete(false)} style={{flex:1,justifyContent:"center"}}>Cancel</Btn>
+                <Btn onClick={()=>deleteJob(showModal.id)} style={{flex:1,justifyContent:"center",background:"#DC2626",color:"#fff"}}>Yes, Delete</Btn>
+              </div>
+            </div>
+          }
+        </div>
       </div>
     </Modal>}
 
