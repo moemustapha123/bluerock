@@ -7,6 +7,7 @@
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-messaging-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-storage-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-functions-compat.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.js"></script>
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
@@ -46,7 +47,7 @@ const NEXT_MAINT = {open:"scheduled",scheduled:"in-progress","in-progress":"reso
 
 const CLEANING_CHECKLIST = [
   {section:"Arrival & General", items:[
-    "Take before pictures",
+    "Record and upload before walkthrough video",
     "Note and report any damages or maintenance issues",
     "Remove all dirty linens and towels and start with laundry"
   ]},
@@ -101,7 +102,7 @@ const CLEANING_CHECKLIST = [
   {section:"Final Checks", items:[
     "All windows and external doors are locked",
     "Keys are in lockbox",
-    "Take photos of completed property and upload them",
+    "Record and upload after walkthrough video",
     "Log completion time in the property management system"
   ]}
 ];
@@ -202,6 +203,20 @@ async function compressImage(file, maxDim=1200, quality=0.75) {
       img.src = ev.target.result;
     };
     reader.readAsDataURL(file);
+  });
+}
+
+async function uploadVideoToStorage(file, jobId, type, onProgress) {
+  const storage = firebase.storage();
+  const ext = (file.name.split(".").pop() || "mp4").toLowerCase();
+  const ref = storage.ref(`videos/${jobId}/${type}.${ext}`);
+  return new Promise((resolve, reject) => {
+    const task = ref.put(file, { contentType: file.type });
+    task.on("state_changed",
+      snap => onProgress && onProgress(Math.round(snap.bytesTransferred / snap.totalBytes * 100)),
+      reject,
+      async () => { resolve(await task.snapshot.ref.getDownloadURL()); }
+    );
   });
 }
 
@@ -398,7 +413,7 @@ function SignupScreen({onSignup,onGoLogin}) {
       <div>
         <label style={{fontSize:12,fontWeight:600,color:COLORS.slate,display:"block",marginBottom:8}}>I am a...</label>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-          {[{value:"manager",label:"Owner / Manager",icon:"🏠",desc:"Full dashboard access"},{value:"cleaner",label:"Cleaner",icon:"🧹",desc:"Cleaning jobs & calendar"},{value:"landscaper",label:"Landscaper",icon:"🌿",desc:"Landscaping schedule"},{value:"garbage",label:"Garbage Collector",icon:"🗑",desc:"Pickup schedule & routes"}].map(r=>(
+          {[{value:"manager",label:"Owner / Manager",icon:"🏠",desc:"Full dashboard access"},{value:"cleaner",label:"Cleaner",icon:"🧹",desc:"Cleaning jobs & calendar"},{value:"landscaper",label:"Landscaper",icon:"🌿",desc:"Landscaping schedule"},{value:"garbage",label:"Garbage Collector",icon:"🗑",desc:"Pickup schedule & routes"},{value:"inventory",label:"Inventory Manager",icon:"📦",desc:"Inventory & restocking"}].map(r=>(
             <div key={r.value} onClick={()=>setRole(r.value)} style={{padding:"12px 14px",borderRadius:10,cursor:"pointer",border:`2px solid ${role===r.value?COLORS.blue:COLORS.border}`,background:role===r.value?COLORS.sky:"#fff",transition:"all 0.15s"}}>
               <div style={{fontSize:20,marginBottom:4}}>{r.icon}</div>
               <div style={{fontSize:12,fontWeight:700,color:role===r.value?COLORS.blue:COLORS.navy}}>{r.label}</div>
@@ -431,17 +446,23 @@ function PendingScreen({user,onLogout}) {
 }
 
 // ─── TEAM VIEW ────────────────────────────────────────────────────────────────
-function TeamView({currentUser,accounts,section="cleaning"}) {
+function TeamView({currentUser,accounts,section="cleaning",properties=[]}) {
   const db = useContext(DbCtx);
   const authorize = async id => { await db.ref(`accounts/${id}`).update({authorized:true}); };
   const revoke    = async id => { await db.ref(`accounts/${id}`).update({authorized:false}); };
   const remove    = async id => { await db.ref(`accounts/${id}`).remove(); };
 
+  const togglePropAccess = async (accountId, propId, current) => {
+    await db.ref(`accounts/${accountId}/accessibleProps/${propId}`).set(!current);
+  };
+
   const sectionRoles = section==="landscape" ? ["landscaper"]
                      : section==="garbage"   ? ["garbage"]
+                     : section==="inventory" ? ["inventory"]
                      : ["cleaner","manager"];
   const sectionLabel = section==="landscape" ? "Landscapers"
                      : section==="garbage"   ? "Garbage Collectors"
+                     : section==="inventory" ? "Inventory Managers"
                      : "Cleaners & Managers";
 
   const pending    = accounts.filter(a=>!a.authorized&&sectionRoles.includes(a.role));
@@ -487,11 +508,45 @@ function TeamView({currentUser,accounts,section="cleaning"}) {
       <h3 style={{fontSize:16,fontWeight:700,color:COLORS.navy,fontFamily:DISPLAY,marginBottom:14}}>{sectionLabel}</h3>
       {authorized.length===0?<div style={{fontSize:13,color:COLORS.slate}}>No authorized {sectionLabel.toLowerCase()} yet.</div>
       :<div style={{display:"flex",flexDirection:"column",gap:10}}>
-        {authorized.map(u=><MemberCard key={u.id} u={u}>
-          <Badge config={{label:"Authorized",bg:"#D1FAE5",color:"#065F46"}} small/>
-          <Btn small variant="ghost" onClick={()=>revoke(u.id)}>Revoke</Btn>
-          <Btn small variant="red"   onClick={()=>remove(u.id)}>Remove</Btn>
-        </MemberCard>)}
+        {authorized.map(u=>(
+          <div key={u.id}>
+            <MemberCard u={u}>
+              <Badge config={{label:"Authorized",bg:"#D1FAE5",color:"#065F46"}} small/>
+              <Btn small variant="ghost" onClick={()=>revoke(u.id)}>Revoke</Btn>
+              <Btn small variant="red"   onClick={()=>remove(u.id)}>Remove</Btn>
+            </MemberCard>
+            {/* Property access panel for inventory managers */}
+            {section==="inventory"&&(()=>{
+              const assigned   = properties.filter(p=>!!(u.accessibleProps&&u.accessibleProps[p.id]));
+              const unassigned = properties.filter(p=>!(u.accessibleProps&&u.accessibleProps[p.id]));
+              return (
+                <div style={{background:COLORS.surface,border:`1px solid ${COLORS.border}`,borderTop:"none",borderRadius:"0 0 12px 12px",padding:"12px 16px"}}>
+                  <div style={{fontSize:11,fontWeight:700,color:COLORS.slate,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Property Access</div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center"}}>
+                    {assigned.map(p=>(
+                      <div key={p.id} style={{display:"flex",alignItems:"center",gap:5,padding:"4px 10px 4px 8px",borderRadius:20,background:`${p.color}18`,border:`1.5px solid ${p.color}`}}>
+                        <span style={{width:7,height:7,borderRadius:"50%",background:p.color,flexShrink:0}}/>
+                        <span style={{fontSize:12,fontWeight:600,color:COLORS.navy}}>{p.name}</span>
+                        <button onClick={()=>togglePropAccess(u.id,p.id,true)}
+                          style={{background:"none",border:"none",cursor:"pointer",color:COLORS.slate,fontSize:15,lineHeight:1,padding:"0 0 0 2px",display:"flex",alignItems:"center"}}>×</button>
+                      </div>
+                    ))}
+                    {unassigned.length>0&&(
+                      <select defaultValue="" onChange={e=>{if(e.target.value){togglePropAccess(u.id,e.target.value,false);e.target.value="";}}}
+                        style={{padding:"4px 10px",borderRadius:20,border:`1.5px dashed ${COLORS.border}`,background:"#fff",fontFamily:FONT,fontSize:12,fontWeight:600,color:COLORS.slate,cursor:"pointer"}}>
+                        <option value="" disabled>+ Add property</option>
+                        {unassigned.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                      </select>
+                    )}
+                    {assigned.length===0&&unassigned.length===0&&(
+                      <span style={{fontSize:12,color:COLORS.slate,fontStyle:"italic"}}>No properties available</span>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        ))}
       </div>}
     </div>
 
@@ -651,25 +706,14 @@ function StayCard({stay,prop,job,readOnly,currentUser}) {
   const st = stayStatus(stay);
   const sc = statusColor(st);
   const [expanded,setExpanded] = useState(st==="active"||st==="upcoming");
-  const [photos,   setPhotos]  = useState([]);
-  const [lightbox, setLightbox]= useState(null);
+  const [videos,   setVideos]  = useState({});
 
   useEffect(() => {
     if (!expanded || !job || !db) return;
-    const ref = db.ref(`jobPhotos/${job.id}`);
-    ref.on("value", s => setPhotos(objArr(s.val())));
+    const ref = db.ref(`jobVideos/${job.id}`);
+    ref.on("value", s => setVideos(s.val() || {}));
     return () => ref.off();
   }, [expanded, job?.id]);
-
-  const uploadPhoto = async (e, type) => {
-    const file = e.target.files[0];
-    if (!file || !job) return;
-    const dataUrl = await compressImage(file);
-    const id = String(Date.now());
-    await db.ref(`jobPhotos/${job.id}/${id}`).set({id, jobId:job.id, type, dataUrl, uploadedBy:currentUser.name, uploadedAt:new Date().toISOString()});
-    e.target.value = "";
-  };
-  const removePhoto = async id => { await db.ref(`jobPhotos/${job.id}/${id}`).remove(); };
 
   const assignCleaner = async cleaner => {
     if (!job) return;
@@ -756,50 +800,27 @@ function StayCard({stay,prop,job,readOnly,currentUser}) {
       </div>}
       {!job&&<div style={{fontSize:12,color:COLORS.slate,marginTop:4}}>No cleaning job created for this checkout yet. Re-sync the iCal to generate one.</div>}
 
-      {/* Before / After Photos */}
+      {/* Walkthrough Videos */}
       {job&&<div style={{marginTop:14,borderTop:`1px solid ${COLORS.border}`,paddingTop:14}}>
         <div style={{fontSize:12,fontWeight:700,color:COLORS.slate,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>
-          Cleaning Photos {photos.length>0?`· ${photos.length} total`:""}
+          Walkthrough Videos
         </div>
         {["before","after"].map(type=>{
-          const typePhotos = photos.filter(p=>p.type===type);
-          const canUpload  = readOnly && job.cleaner===currentUser?.name;
+          const video = videos[type];
           return <div key={type} style={{marginBottom:14}}>
             <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:7}}>
               <span style={{fontSize:11,fontWeight:700,color:type==="before"?COLORS.amber:COLORS.green,textTransform:"uppercase",letterSpacing:.8}}>
-                {type==="before"?"📸 Before":"✅ After"} ({typePhotos.length})
+                {type==="before"?"📹 Before":"✅ After"}
               </span>
-              {canUpload&&<label style={{cursor:"pointer",display:"inline-flex",alignItems:"center",gap:5,padding:"4px 12px",borderRadius:20,background:COLORS.sky,color:COLORS.blue,fontSize:11,fontWeight:600,border:`1.5px solid ${COLORS.border}`}}>
-                + Add Photo
-                <input type="file" accept="image/*" onChange={e=>uploadPhoto(e,type)} style={{display:"none"}}/>
-              </label>}
             </div>
-            {typePhotos.length>0
-              ?<div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                {typePhotos.map(p=>(
-                  <div key={p.id} style={{position:"relative"}}>
-                    <img src={p.dataUrl} onClick={()=>setLightbox(p)}
-                      style={{width:84,height:84,objectFit:"cover",borderRadius:10,cursor:"zoom-in",border:`2px solid ${type==="before"?"#FEF3C7":"#D1FAE5"}`}}/>
-                    {(readOnly?p.uploadedBy===currentUser?.name:true)&&
-                      <button onClick={()=>removePhoto(p.id)}
-                        style={{position:"absolute",top:-6,right:-6,width:20,height:20,borderRadius:"50%",background:COLORS.red,color:"#fff",border:"2px solid #fff",cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1,padding:0}}>×</button>}
-                    <div style={{fontSize:9,color:COLORS.slate,textAlign:"center",marginTop:3,maxWidth:84,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.uploadedBy}</div>
-                  </div>
-                ))}
-              </div>
-              :<div style={{fontSize:12,color:COLORS.slate,fontStyle:"italic"}}>
-                {canUpload?`Tap "+ Add Photo" to add ${type} photos.`:`No ${type} photos yet.`}
-              </div>}
+            {video
+              ?<>
+                <video src={video.url} controls style={{width:"100%",borderRadius:10,maxHeight:200,background:"#000"}}/>
+                <div style={{fontSize:10,color:COLORS.slate,marginTop:4}}>by {video.uploadedBy} · {new Date(video.uploadedAt).toLocaleString()}</div>
+              </>
+              :<div style={{fontSize:12,color:COLORS.slate,fontStyle:"italic"}}>No {type} walkthrough video yet.</div>}
           </div>;
         })}
-      </div>}
-
-      {lightbox&&<div onClick={()=>setLightbox(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.93)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center",cursor:"zoom-out"}}>
-        <img src={lightbox.dataUrl} style={{maxWidth:"95vw",maxHeight:"88vh",objectFit:"contain",borderRadius:10}}/>
-        <button onClick={()=>setLightbox(null)} style={{position:"absolute",top:16,right:20,background:"none",border:"none",color:"#fff",fontSize:32,cursor:"pointer",lineHeight:1}}>×</button>
-        <div style={{position:"absolute",bottom:20,left:0,right:0,textAlign:"center",color:"rgba(255,255,255,0.75)",fontSize:12}}>
-          {lightbox.type.charAt(0).toUpperCase()+lightbox.type.slice(1)} photo · by {lightbox.uploadedBy} · {new Date(lightbox.uploadedAt).toLocaleString()}
-        </div>
       </div>}
     </div>}
   </div>;
@@ -883,12 +904,9 @@ function EditPropertyModal({prop,onClose}) {
           </select>
         </div>
       </div>
-<<<<<<< Updated upstream
-=======
       <div style={{background:COLORS.sky,borderRadius:8,padding:"10px 14px",fontSize:12,color:COLORS.slate}}>
         🗑 Garbage jobs are auto-scheduled every Sunday for properties with bookings in the past 7 days. No manual assignment needed.
       </div>
->>>>>>> Stashed changes
     </div>
     <div style={{display:"flex",gap:10,marginTop:20}}>
       <Btn onClick={save}>Save</Btn>
@@ -1187,6 +1205,105 @@ function InventoryView({inventory,properties,currentUser}) {
 }
 
 // ─── CLEANING CHECKLIST PANEL ─────────────────────────────────────────────────
+// ─── INVENTORY MANAGER VIEW ──────────────────────────────────────────────────
+function InventoryManagerView({inventory, properties, currentUser, accounts}) {
+  const db = useContext(DbCtx);
+  const myAccount      = accounts.find(a => a.id === currentUser.id) || currentUser;
+  const accessibleIds  = Object.keys(myAccount.accessibleProps || {}).filter(k => myAccount.accessibleProps[k]);
+  const myProps        = properties.filter(p => accessibleIds.includes(p.id));
+  const [selProp, setSelProp] = useState(null);
+
+  const activePropId = selProp || myProps[0]?.id || null;
+  const propInv      = inventory.filter(i => i.propertyId === activePropId);
+  const pending      = propInv.filter(i => i.status === "pending");
+  const ordered      = propInv.filter(i => i.status === "ordered");
+  const restocked    = propInv.filter(i => i.status === "restocked");
+
+  const updateStatus = async (item, status) => {
+    await db.ref(`inventory/${item.propertyId}/${item.id}`).update({
+      status,
+      ...(status === "ordered"   ? {orderedAt:   new Date().toISOString()} : {}),
+      ...(status === "restocked" ? {restockedAt: new Date().toISOString(), restockedBy: currentUser.name} : {}),
+    });
+  };
+
+  if (myProps.length === 0) return (
+    <Card style={{textAlign:"center", padding:48}}>
+      <div style={{fontSize:40, marginBottom:12}}>📦</div>
+      <div style={{fontWeight:700, fontSize:16, color:COLORS.navy, marginBottom:6}}>No Properties Assigned Yet</div>
+      <div style={{fontSize:13, color:COLORS.slate, lineHeight:1.6}}>An owner needs to grant you access to specific properties before you can manage their inventory.</div>
+    </Card>
+  );
+
+  const InvItem = ({item}) => (
+    <Card style={{padding:"14px 18px", marginBottom:8}}>
+      <div style={{display:"flex", alignItems:"center", gap:12}}>
+        <span style={{fontSize:22}}>📦</span>
+        <div style={{flex:1}}>
+          <div style={{display:"flex", alignItems:"center", gap:8, marginBottom:3}}>
+            <span style={{fontWeight:700, fontSize:14, color:COLORS.navy}}>{item.item}</span>
+            <Badge config={invStatusCfg[item.status]} small/>
+          </div>
+          <div style={{fontSize:11, color:COLORS.slate}}>
+            Flagged by {item.flaggedBy} · {new Date(item.flaggedAt).toLocaleString()}
+            {item.orderedAt   && ` · Ordered ${new Date(item.orderedAt).toLocaleDateString()}`}
+            {item.restockedAt && ` · Restocked ${new Date(item.restockedAt).toLocaleDateString()}`}
+          </div>
+        </div>
+        <div style={{display:"flex", gap:6}}>
+          {item.status==="pending"   && <Btn small variant="amber" onClick={()=>updateStatus(item,"ordered")}>Mark Ordered</Btn>}
+          {item.status==="ordered"   && <Btn small variant="green" onClick={()=>updateStatus(item,"restocked")}>Mark Restocked</Btn>}
+          {item.status==="restocked" && <span style={{fontSize:12, color:COLORS.green, fontWeight:600}}>✓ Done</span>}
+        </div>
+      </div>
+    </Card>
+  );
+
+  return (
+    <div>
+      {/* Property tabs */}
+      <div style={{display:"flex", gap:6, marginBottom:20, overflowX:"auto", paddingBottom:4}}>
+        {myProps.map(p => (
+          <button key={p.id} onClick={()=>setSelProp(p.id)} style={{
+            padding:"8px 16px", borderRadius:20, border:"none", cursor:"pointer",
+            fontFamily:FONT, fontWeight:600, fontSize:12, whiteSpace:"nowrap",
+            background: activePropId===p.id ? p.color : COLORS.sky,
+            color:      activePropId===p.id ? "#fff"   : COLORS.slate,
+            display:"flex", alignItems:"center", gap:6,
+          }}>
+            <span style={{width:8, height:8, borderRadius:"50%", display:"inline-block",
+              background: activePropId===p.id ? "rgba(255,255,255,0.7)" : p.color}}/>
+            {p.name}
+            {inventory.filter(i=>i.propertyId===p.id&&i.status==="pending").length > 0 &&
+              <span style={{background:"#EF4444", color:"#fff", fontSize:10, fontWeight:700, padding:"1px 6px", borderRadius:20}}>
+                {inventory.filter(i=>i.propertyId===p.id&&i.status==="pending").length}
+              </span>}
+          </button>
+        ))}
+      </div>
+
+      {/* Stats */}
+      <div style={{display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12, marginBottom:20}}>
+        {[[pending.length,"Needs Order",COLORS.red,"#FEE2E2"],[ordered.length,"Ordered",COLORS.amber,"#FEF3C7"],[restocked.length,"Restocked",COLORS.green,"#D1FAE5"]].map(([v,l,c,bg])=>(
+          <div key={l} style={{background:bg, borderRadius:14, padding:"14px 18px", textAlign:"center"}}>
+            <div style={{fontSize:24, fontWeight:700, color:c, fontFamily:DISPLAY}}>{v}</div>
+            <div style={{fontSize:12, color:COLORS.slate, marginTop:2}}>{l}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Item list */}
+      {pending.length===0&&ordered.length===0&&restocked.length===0
+        ? <div style={{textAlign:"center", padding:"32px 0", color:COLORS.slate, fontSize:14}}>All stocked up — no items flagged for this property 🎉</div>
+        : <>
+            {pending.length>0&&<><div style={{fontSize:12,fontWeight:700,color:COLORS.red,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Needs Order</div>{pending.map(i=><InvItem key={i.id} item={i}/>)}</>}
+            {ordered.length>0&&<><div style={{fontSize:12,fontWeight:700,color:COLORS.amber,textTransform:"uppercase",letterSpacing:1,marginBottom:8,marginTop:14}}>Ordered</div>{ordered.map(i=><InvItem key={i.id} item={i}/>)}</>}
+            {restocked.length>0&&<><div style={{fontSize:12,fontWeight:700,color:COLORS.green,textTransform:"uppercase",letterSpacing:1,marginBottom:8,marginTop:14}}>Restocked</div>{restocked.map(i=><InvItem key={i.id} item={i}/>)}</>}
+          </>}
+    </div>
+  );
+}
+
 function ChecklistPanel({jobId, readOnly, onProgress, defaultCollapsed=false}) {
   const db = useContext(DbCtx);
   const [data,      setData]      = useState({});
@@ -1293,16 +1410,43 @@ function ChecklistPanel({jobId, readOnly, onProgress, defaultCollapsed=false}) {
 }
 
 // ─── CLEANER JOB CARD ─────────────────────────────────────────────────────────
-function CleanerJobCard({job, properties, highlight, todayStr, onSelect}) {
+function CleanerJobCard({job, properties, highlight, todayStr, onSelect, currentUser}) {
   const db = useContext(DbCtx);
   const [checklistCount, setChecklistCount] = useState(0);
+  const [videos,         setVideos]         = useState({});
+  const [uploading,      setUploading]      = useState(null);
+  const [uploadPct,      setUploadPct]      = useState(0);
 
   const prop     = properties.find(p => p.id === job.propertyId) || {name:"Unknown",color:"#94A3B8"};
   const isToday  = job.checkoutDate === todayStr;
   const dateLabel = isToday ? "Today"
     : new Date(...job.checkoutDate.split("-").map((v,i) => i===1 ? v-1 : Number(v)))
         .toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
-  const allChecked = checklistCount >= CHECKLIST_TOTAL;
+  const allChecked  = checklistCount >= CHECKLIST_TOTAL;
+  const beforeVideo = videos.before;
+  const afterVideo  = videos.after;
+
+  useEffect(() => {
+    if (!db || !job.id) return;
+    const ref = db.ref(`jobVideos/${job.id}`);
+    ref.on("value", s => setVideos(s.val() || {}));
+    return () => ref.off();
+  }, [job.id]);
+
+  const handleVideoUpload = async (e, type) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.size > 500 * 1024 * 1024) { alert("Video must be under 500 MB."); return; }
+    setUploading(type); setUploadPct(0);
+    try {
+      const url = await uploadVideoToStorage(file, job.id, type, pct => setUploadPct(pct));
+      await db.ref(`jobVideos/${job.id}/${type}`).set({
+        type, url, uploadedBy: currentUser?.name || "Cleaner",
+        uploadedAt: new Date().toISOString(), jobId: job.id,
+      });
+    } catch(err) { alert("Upload failed: " + err.message); }
+    finally { setUploading(null); e.target.value = ""; }
+  };
 
   const updateStatus = async (status) => {
     const now = new Date().toISOString();
@@ -1351,13 +1495,32 @@ function CleanerJobCard({job, properties, highlight, todayStr, onSelect}) {
             <span style={{fontSize:11,color:COLORS.slate}}>Started {new Date(job.arrivedAt).toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"})}</span>}
         </div>
 
-        {job.status==="pending"&&<button
-          onClick={e=>{e.stopPropagation();updateStatus("in-progress");}}
-          style={{width:"100%",padding:"14px",borderRadius:12,border:"none",cursor:"pointer",
-                  background:COLORS.amber,color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,
-                  display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
-          🕐 Start Cleaning
-        </button>}
+        {job.status==="pending"&&<div onClick={e=>e.stopPropagation()}>
+          {!beforeVideo
+            ?<label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:7,
+                            width:"100%",padding:"13px",borderRadius:12,border:"2px dashed #D97706",
+                            cursor:uploading?"not-allowed":"pointer",background:"#FFFBEB",
+                            color:"#92400E",fontFamily:FONT,fontSize:14,fontWeight:700,marginBottom:10,boxSizing:"border-box"}}>
+                {uploading==="before"?`Uploading… ${uploadPct}%`:"📹 Upload Before Video (required)"}
+                <input type="file" accept="video/*" capture="environment" style={{display:"none"}}
+                  onChange={e=>handleVideoUpload(e,"before")} disabled={!!uploading}/>
+              </label>
+            :<div style={{display:"flex",alignItems:"center",gap:6,padding:"8px 12px",borderRadius:10,
+                          background:"#D1FAE5",marginBottom:10,fontSize:13,fontWeight:600,color:"#065F46"}}>
+                ✅ Before video uploaded
+              </div>}
+          <button
+            onClick={e=>{e.stopPropagation();if(beforeVideo)updateStatus("in-progress");}}
+            disabled={!beforeVideo}
+            style={{width:"100%",padding:"14px",borderRadius:12,border:"none",
+                    cursor:beforeVideo?"pointer":"not-allowed",
+                    background:beforeVideo?COLORS.amber:"#9CA3AF",
+                    color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,
+                    display:"flex",alignItems:"center",justifyContent:"center",gap:8,
+                    opacity:beforeVideo?1:0.65}}>
+            🕐 Start Cleaning
+          </button>
+        </div>}
 
         {job.status==="in-progress"&&<div onClick={e=>e.stopPropagation()}>
           <ChecklistPanel
@@ -1365,16 +1528,29 @@ function CleanerJobCard({job, properties, highlight, todayStr, onSelect}) {
             readOnly={false}
             onProgress={count => setChecklistCount(count)}
           />
+          {!afterVideo
+            ?<label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:7,
+                            width:"100%",padding:"13px",borderRadius:12,border:"2px dashed #6366F1",
+                            cursor:uploading?"not-allowed":"pointer",background:"#EEF2FF",
+                            color:"#3730A3",fontFamily:FONT,fontSize:14,fontWeight:700,marginTop:12,boxSizing:"border-box"}}>
+                {uploading==="after"?`Uploading… ${uploadPct}%`:"📹 Upload After Video (required)"}
+                <input type="file" accept="video/*" capture="environment" style={{display:"none"}}
+                  onChange={e=>handleVideoUpload(e,"after")} disabled={!!uploading}/>
+              </label>
+            :<div style={{display:"flex",alignItems:"center",gap:6,padding:"8px 12px",borderRadius:10,
+                          background:"#D1FAE5",marginTop:12,marginBottom:4,fontSize:13,fontWeight:600,color:"#065F46"}}>
+                ✅ After video uploaded
+              </div>}
           <button
-            onClick={() => { if (allChecked) updateStatus("complete"); }}
-            disabled={!allChecked}
-            style={{width:"100%",padding:"14px",borderRadius:12,border:"none",marginTop:12,
-                    cursor:allChecked?"pointer":"not-allowed",
-                    background:allChecked?COLORS.green:"#9CA3AF",
+            onClick={() => { if (allChecked && afterVideo) updateStatus("complete"); }}
+            disabled={!allChecked || !afterVideo}
+            style={{width:"100%",padding:"14px",borderRadius:12,border:"none",marginTop:10,
+                    cursor:(allChecked&&afterVideo)?"pointer":"not-allowed",
+                    background:(allChecked&&afterVideo)?COLORS.green:"#9CA3AF",
                     color:"#fff",fontFamily:FONT,fontSize:15,fontWeight:700,
                     display:"flex",alignItems:"center",justifyContent:"center",gap:8,
-                    opacity:allChecked?1:0.65}}>
-            {allChecked ? "✅ Mark Complete" : `Complete checklist first (${checklistCount}/${CHECKLIST_TOTAL})`}
+                    opacity:(allChecked&&afterVideo)?1:0.65}}>
+            {!afterVideo?"Upload after video first":allChecked?"✅ Mark Complete":`Complete checklist (${checklistCount}/${CHECKLIST_TOTAL})`}
           </button>
         </div>}
 
@@ -1432,12 +1608,12 @@ function MyJobsView({jobs, properties, currentUser}) {
 
     {/* Today */}
     {todayJobs.length>0&&<Section title="Today" count={todayJobs.length} accent="#DC2626">
-      {todayJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} highlight todayStr={todayStr} onSelect={setSelected}/>)}
+      {todayJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} highlight todayStr={todayStr} onSelect={setSelected} currentUser={currentUser}/>)}
     </Section>}
 
     {/* Upcoming */}
     {upcomingJobs.length>0&&<Section title="Upcoming" count={upcomingJobs.length}>
-      {upcomingJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} todayStr={todayStr} onSelect={setSelected}/>)}
+      {upcomingJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} todayStr={todayStr} onSelect={setSelected} currentUser={currentUser}/>)}
     </Section>}
 
     {/* Empty state */}
@@ -1455,7 +1631,7 @@ function MyJobsView({jobs, properties, currentUser}) {
                 width:"100%",marginBottom:12}}>
         {showDone?"▲ Hide":"▼ Show"} completed jobs ({doneJobs.length})
       </button>
-      {showDone&&doneJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} todayStr={todayStr} onSelect={setSelected}/>)}
+      {showDone&&doneJobs.map(j=><CleanerJobCard key={j.id} job={j} properties={properties} todayStr={todayStr} onSelect={setSelected} currentUser={currentUser}/>)}
     </div>}
 
     {/* Detail modal */}
@@ -1935,19 +2111,20 @@ function ScheduleManagerView({jobs, jobType, accounts, properties, currentUser})
 // ─── OPERATIONS CALENDAR ─────────────────────────────────────────────────────
 function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
   const db = useContext(DbCtx);
-  const [photos,setPhotos]         = useState([]);
+  const [videos,setVideos]         = useState({});
   const [liveJob,setLiveJob]       = useState(detail.job||null);
-  const [lightbox,setLightbox]     = useState(null);
   const [clChecklistCount, setClChecklistCount] = useState(0);
+  const [uploadingType, setUploadingType] = useState(null);
+  const [uploadPct,     setUploadPct]     = useState(0);
   const cleaners = (accounts||[]).filter(a=>a.role==="cleaner").map(a=>a.name);
 
   useEffect(()=>{
     if (!detail.job?.id||!db) return;
     const jobRef   = db.ref(`jobs/${detail.job.id}`);
-    const photoRef = db.ref(`jobPhotos/${detail.job.id}`);
+    const videoRef = db.ref(`jobVideos/${detail.job.id}`);
     jobRef.on("value",   s=>{ if(s.val()) setLiveJob(s.val()); });
-    photoRef.on("value", s=>setPhotos(objArr(s.val())));
-    return ()=>{ jobRef.off(); photoRef.off(); };
+    videoRef.on("value", s=>setVideos(s.val() || {}));
+    return ()=>{ jobRef.off(); videoRef.off(); };
   },[detail.job?.id]);
 
   const assignCleaner = async val => {
@@ -1958,24 +2135,27 @@ function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
     if (!liveJob||!db) return;
     await db.ref(`jobs/${liveJob.id}`).update({status,updatedAt:new Date().toISOString()});
   };
-  const uploadPhoto = async (e, type) => {
+  const uploadVideo = async (e, type) => {
     const file = e.target.files[0];
-    if (!file||!liveJob) return;
-    const dataUrl = await compressImage(file);
-    const id = String(Date.now());
-    await db.ref(`jobPhotos/${liveJob.id}/${id}`).set({
-      id, jobId:liveJob.id, type, dataUrl,
-      uploadedBy:currentUser.name, uploadedAt:new Date().toISOString()
-    });
-    e.target.value="";
+    if (!file || !liveJob) return;
+    if (file.size > 500 * 1024 * 1024) { alert("Video must be under 500 MB."); return; }
+    setUploadingType(type); setUploadPct(0);
+    try {
+      const url = await uploadVideoToStorage(file, liveJob.id, type, pct => setUploadPct(pct));
+      await db.ref(`jobVideos/${liveJob.id}/${type}`).set({
+        type, url, uploadedBy: currentUser.name,
+        uploadedAt: new Date().toISOString(), jobId: liveJob.id,
+      });
+    } catch(err) { alert("Upload failed: " + err.message); }
+    finally { setUploadingType(null); e.target.value = ""; }
   };
-  const removePhoto = async id => {
+  const removeVideo = async type => {
     if (!liveJob) return;
-    await db.ref(`jobPhotos/${liveJob.id}/${id}`).remove();
+    await db.ref(`jobVideos/${liveJob.id}/${type}`).remove();
   };
 
-  const beforePhotos = photos.filter(p=>p.type==="before");
-  const afterPhotos  = photos.filter(p=>p.type==="after");
+  const beforeVideo = videos.before;
+  const afterVideo  = videos.after;
 
   return <Modal onClose={onClose}>
     {/* Header */}
@@ -2043,21 +2223,61 @@ function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
         {liveJob.cleaner&&liveJob.cleaner!==currentUser.name&&
           <div style={{fontSize:12,color:COLORS.slate,marginBottom:6,fontStyle:"italic"}}>Assigned to {liveJob.cleaner}</div>}
         {liveJob.cleaner===currentUser.name&&<>
+          {/* PENDING: before video required before starting */}
           {liveJob.status==="pending"&&<>
-            <Btn variant="amber" small onClick={()=>updateJobStatus("in-progress")}
-              style={{width:"100%",justifyContent:"center",marginBottom:6}}>🕐 Start Cleaning</Btn>
+            <div style={{marginBottom:10,padding:"12px 14px",borderRadius:10,
+                         background:beforeVideo?"#D1FAE5":"#FFFBEB",
+                         border:`1px solid ${beforeVideo?"#6EE7B7":"#FDE68A"}`}}>
+              <div style={{fontWeight:700,fontSize:13,color:beforeVideo?"#065F46":"#92400E",marginBottom:beforeVideo?8:6}}>
+                {beforeVideo?"✅ Before Video Uploaded":"📹 Before Walkthrough — Required to Start"}
+              </div>
+              {beforeVideo
+                ?<><video src={beforeVideo.url} controls style={{width:"100%",borderRadius:8,maxHeight:180,background:"#000"}}/>
+                    <button onClick={()=>removeVideo("before")} style={{marginTop:6,fontSize:11,color:COLORS.red,background:"none",border:"none",cursor:"pointer",padding:0}}>Remove video</button></>
+                :<label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"11px",borderRadius:8,
+                                border:"2px dashed #D97706",cursor:uploadingType?"not-allowed":"pointer",
+                                fontSize:13,color:"#92400E",fontWeight:600,background:"#FFFBEB"}}>
+                    {uploadingType==="before"?`Uploading… ${uploadPct}%`:"📹 Record & Upload Before Video"}
+                    <input type="file" accept="video/*" capture="environment" style={{display:"none"}}
+                      onChange={e=>uploadVideo(e,"before")} disabled={!!uploadingType}/>
+                  </label>}
+            </div>
+            <Btn variant="amber" small onClick={()=>beforeVideo&&updateJobStatus("in-progress")}
+              disabled={!beforeVideo}
+              style={{width:"100%",justifyContent:"center",marginBottom:6,
+                      opacity:beforeVideo?1:0.5,cursor:beforeVideo?"pointer":"not-allowed"}}>
+              🕐 Start Cleaning
+            </Btn>
             <Btn variant="ghost" small onClick={()=>assignCleaner(null)}
               style={{width:"100%",justifyContent:"center"}}>Unclaim</Btn>
           </>}
+          {/* IN-PROGRESS: checklist + after video required to complete */}
           {liveJob.status==="in-progress"&&<>
             <ChecklistPanel jobId={liveJob.id} readOnly={false} onProgress={c=>setClChecklistCount(c)}/>
+            <div style={{marginTop:10,marginBottom:6,padding:"12px 14px",borderRadius:10,
+                         background:afterVideo?"#D1FAE5":"#EEF2FF",
+                         border:`1px solid ${afterVideo?"#6EE7B7":"#C7D2FE"}`}}>
+              <div style={{fontWeight:700,fontSize:13,color:afterVideo?"#065F46":"#3730A3",marginBottom:afterVideo?8:6}}>
+                {afterVideo?"✅ After Video Uploaded":"📹 After Walkthrough — Required to Complete"}
+              </div>
+              {afterVideo
+                ?<><video src={afterVideo.url} controls style={{width:"100%",borderRadius:8,maxHeight:180,background:"#000"}}/>
+                    <button onClick={()=>removeVideo("after")} style={{marginTop:6,fontSize:11,color:COLORS.red,background:"none",border:"none",cursor:"pointer",padding:0}}>Remove video</button></>
+                :<label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"11px",borderRadius:8,
+                                border:"2px dashed #6366F1",cursor:uploadingType?"not-allowed":"pointer",
+                                fontSize:13,color:"#3730A3",fontWeight:600,background:"#EEF2FF"}}>
+                    {uploadingType==="after"?`Uploading… ${uploadPct}%`:"📹 Record & Upload After Video"}
+                    <input type="file" accept="video/*" capture="environment" style={{display:"none"}}
+                      onChange={e=>uploadVideo(e,"after")} disabled={!!uploadingType}/>
+                  </label>}
+            </div>
             <Btn variant="green" small
-              onClick={()=>clChecklistCount>=CHECKLIST_TOTAL&&updateJobStatus("complete")}
-              disabled={clChecklistCount<CHECKLIST_TOTAL}
-              style={{width:"100%",justifyContent:"center",marginTop:10,
-                      opacity:clChecklistCount>=CHECKLIST_TOTAL?1:0.6,
-                      cursor:clChecklistCount>=CHECKLIST_TOTAL?"pointer":"not-allowed"}}>
-              {clChecklistCount>=CHECKLIST_TOTAL?"✓ Mark Complete":`Checklist: ${clChecklistCount}/${CHECKLIST_TOTAL}`}
+              onClick={()=>{if(clChecklistCount>=CHECKLIST_TOTAL&&afterVideo)updateJobStatus("complete");}}
+              disabled={clChecklistCount<CHECKLIST_TOTAL||!afterVideo}
+              style={{width:"100%",justifyContent:"center",marginTop:2,
+                      opacity:(clChecklistCount>=CHECKLIST_TOTAL&&afterVideo)?1:0.6,
+                      cursor:(clChecklistCount>=CHECKLIST_TOTAL&&afterVideo)?"pointer":"not-allowed"}}>
+              {!afterVideo?"Upload after video to complete":clChecklistCount>=CHECKLIST_TOTAL?"✓ Mark Complete":`Checklist: ${clChecklistCount}/${CHECKLIST_TOTAL}`}
             </Btn>
           </>}
         </>}
@@ -2078,50 +2298,26 @@ function BookingDetailModal({detail,onClose,currentUser,accounts,isCleaner}) {
           <ChecklistPanel jobId={liveJob.id} readOnly={true} defaultCollapsed={true}/>}
       </div>}
 
-      {/* Photo upload */}
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
-        <label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"8px 0",borderRadius:8,border:`1.5px dashed ${COLORS.border}`,cursor:"pointer",fontSize:12,color:COLORS.slate,fontWeight:600}}>
-          📷 Before
-          <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>uploadPhoto(e,"before")}/>
-        </label>
-        <label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"8px 0",borderRadius:8,border:`1.5px dashed ${COLORS.border}`,cursor:"pointer",fontSize:12,color:COLORS.slate,fontWeight:600}}>
-          ✅ After
-          <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>uploadPhoto(e,"after")}/>
-        </label>
-      </div>
-
-      {/* Photo grid */}
-      {photos.length>0&&<div>
-        {beforePhotos.length>0&&<div style={{marginBottom:8}}>
-          <div style={{fontSize:11,fontWeight:700,color:COLORS.slate,marginBottom:6}}>BEFORE ({beforePhotos.length})</div>
-          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-            {beforePhotos.map(p=><div key={p.id} style={{position:"relative"}}>
-              <img src={p.dataUrl} alt="before" onClick={()=>setLightbox(p.dataUrl)}
-                style={{width:70,height:70,objectFit:"cover",borderRadius:8,cursor:"pointer",border:`2px solid ${COLORS.border}`}}/>
-              <button onClick={()=>removePhoto(p.id)}
-                style={{position:"absolute",top:-6,right:-6,background:"#EF4444",color:"#fff",border:"none",borderRadius:"50%",width:18,height:18,fontSize:11,cursor:"pointer",lineHeight:"18px",padding:0}}>×</button>
-            </div>)}
-          </div>
-        </div>}
-        {afterPhotos.length>0&&<div>
-          <div style={{fontSize:11,fontWeight:700,color:COLORS.slate,marginBottom:6}}>AFTER ({afterPhotos.length})</div>
-          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-            {afterPhotos.map(p=><div key={p.id} style={{position:"relative"}}>
-              <img src={p.dataUrl} alt="after" onClick={()=>setLightbox(p.dataUrl)}
-                style={{width:70,height:70,objectFit:"cover",borderRadius:8,cursor:"pointer",border:`2px solid ${COLORS.green}`}}/>
-              <button onClick={()=>removePhoto(p.id)}
-                style={{position:"absolute",top:-6,right:-6,background:"#EF4444",color:"#fff",border:"none",borderRadius:"50%",width:18,height:18,fontSize:11,cursor:"pointer",lineHeight:"18px",padding:0}}>×</button>
-            </div>)}
-          </div>
-        </div>}
+      {/* Walkthrough videos — manager/owner read-only view */}
+      {!isCleaner&&<div style={{marginTop:4}}>
+        <div style={{fontSize:11,fontWeight:700,color:COLORS.slate,textTransform:"uppercase",letterSpacing:.8,marginBottom:10}}>Walkthrough Videos</div>
+        {["before","after"].map(type=>{
+          const v = videos[type];
+          return <div key={type} style={{marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:700,color:type==="before"?COLORS.amber:COLORS.green,textTransform:"uppercase",letterSpacing:.8,marginBottom:6}}>
+              {type==="before"?"📹 Before":"✅ After"}
+            </div>
+            {v
+              ?<>
+                <video src={v.url} controls style={{width:"100%",borderRadius:10,maxHeight:220,background:"#000"}}/>
+                <div style={{fontSize:11,color:COLORS.slate,marginTop:4}}>by {v.uploadedBy} · {new Date(v.uploadedAt).toLocaleString()}</div>
+              </>
+              :<div style={{fontSize:12,color:COLORS.slate,fontStyle:"italic",padding:"4px 0"}}>No {type} video yet.</div>}
+          </div>;
+        })}
       </div>}
     </div>}
 
-    {/* Lightbox */}
-    {lightbox&&<div onClick={()=>setLightbox(null)}
-      style={{position:"fixed",inset:0,background:"rgba(0,0,0,.85)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}}>
-      <img src={lightbox} style={{maxWidth:"90vw",maxHeight:"90vh",borderRadius:12,boxShadow:"0 8px 40px #0008"}}/>
-    </div>}
   </Modal>;
 }
 
@@ -2218,6 +2414,12 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
   const [hidden,    setHidden]     = useState(new Set());
   const [showFilter,setShowFilter] = useState(false);
 
+  const fcEndDate = dateStr => {
+    const [y,m,d] = dateStr.split("-").map(Number);
+    const dt = new Date(y,m-1,d+1);
+    return dt.getFullYear()+"-"+String(dt.getMonth()+1).padStart(2,"0")+"-"+String(dt.getDate()).padStart(2,"0");
+  };
+
   // Return set of "propId_date" that are same-day turnovers
   const getTurnovers = arr => {
     const checkouts = new Set(arr.map(s=>`${s.propId}_${s.end}`));
@@ -2228,20 +2430,6 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
 
   const buildEvents = (staysArr,propsArr,jobsArr,hiddenSet) => {
     const turnovers = getTurnovers(staysArr);
-<<<<<<< Updated upstream
-    return staysArr.filter(s=>!hiddenSet.has(s.propId)).map(s=>{
-      const prop = propsArr.find(p=>p.id===s.propId);
-      if (!prop) return null;
-      const job = jobsArr.find(j=>j.propertyId===s.propId&&j.checkoutDate===s.end);
-      const isTurnover = turnovers.has(`${s.propId}_${s.start}`);
-      return {
-        id: s.uid, start: s.start, end: s.end, allDay: true, title: prop.name,
-        backgroundColor: prop.color, borderColor: prop.color,
-        classNames: isTurnover?['fc-ev-turnover']:[],
-        extendedProps: {stay:s,prop,job,isTurnover},
-      };
-    }).filter(Boolean);
-=======
 
     // Build a map of turnover dates: "propId_date" -> {checkoutStay, checkinStay, date, propId}
     const splitMap = {};
@@ -2302,7 +2490,6 @@ function OpsCalendarView({stays,properties,jobs,currentUser,accounts}) {
     });
 
     return events;
->>>>>>> Stashed changes
   };
 
   // Init FullCalendar once
@@ -3046,7 +3233,8 @@ function App() {
   const isCleaner    = currentUser.role==="cleaner";
   const isLandscaper = currentUser.role==="landscaper";
   const isGarbage    = currentUser.role==="garbage";
-  const isWorker     = isCleaner || isLandscaper || isGarbage;
+  const isInventory  = currentUser.role==="inventory";
+  const isWorker     = isCleaner || isLandscaper || isGarbage || isInventory;
   const isOwner      = currentUser.role==="owner";
   const pendingCount = isOwner?accounts.filter(a=>!a.authorized&&a.role!=="owner").length:0;
 
@@ -3060,7 +3248,10 @@ function App() {
 
   const changeSection = s => { setSection(s); setTab("dashboard"); };
 
-  const tabs = isLandscaper ? [
+  const tabs = isInventory ? [
+    {id:"inventory",   label:"Inventory",   icon:"📦"},
+    {id:"maintenance", label:"Maintenance", icon:"🔧"},
+  ] : isLandscaper ? [
     {id:"myjobs",    label:"My Jobs",  icon:"🌿", badge:landscapeBadge},
     {id:"lscalendar",label:"Calendar", icon:"📅"},
   ] : isGarbage ? [
@@ -3158,9 +3349,10 @@ function App() {
       <div style={{maxWidth:tab==="calendar"?1100:860,margin:"0 auto",padding:"24px 20px"}}>
         {!isWorker&&<div style={{display:"flex",gap:6,marginBottom:16,background:COLORS.white,padding:"6px 8px",borderRadius:14,border:`1px solid ${COLORS.border}`,width:"fit-content",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
           {[
-            {id:"cleaning",  label:"Cleaning",    icon:"🧹"},
-            {id:"landscape", label:"Landscaping", icon:"🌿"},
-            {id:"garbage",   label:"Garbage",     icon:"🗑"},
+            {id:"cleaning",   label:"Cleaning",    icon:"🧹"},
+            {id:"landscape",  label:"Landscaping", icon:"🌿"},
+            {id:"garbage",    label:"Garbage",     icon:"🗑"},
+            {id:"inventory",  label:"Inventory",   icon:"📦"},
           ].map(s=>(
             <button key={s.id} onClick={()=>changeSection(s.id)} style={{
               padding:"7px 18px",borderRadius:9,border:"none",cursor:"pointer",
@@ -3181,9 +3373,15 @@ function App() {
         {tab==="jobs"      &&!isWorker&&<JobsView jobs={jobs} properties={properties} accounts={accounts} currentUser={currentUser}/>}
         {tab==="landscape"  &&!isWorker&&<ScheduleManagerView jobs={landscapeJobs} jobType="landscape" accounts={accounts} properties={properties} currentUser={currentUser}/>}
         {tab==="garbage"    &&!isWorker&&<ScheduleManagerView jobs={garbageJobs} jobType="garbage" accounts={accounts} properties={properties} currentUser={currentUser}/>}
-        {tab==="maintenance"&&<MaintenanceView maintenance={maintenance} properties={properties} currentUser={currentUser}/>}
-        {tab==="inventory"  &&<InventoryView inventory={inventory} properties={properties} currentUser={currentUser}/>}
-        {tab==="team"       &&isOwner&&<TeamView currentUser={currentUser} accounts={accounts} section={section}/>}
+        {tab==="maintenance"&&<MaintenanceView
+          maintenance={isInventory
+            ? maintenance.filter(t=>{const acc=accounts.find(a=>a.id===currentUser.id);return acc?.accessibleProps?.[t.propertyId];})
+            : maintenance}
+          properties={isInventory ? properties.filter(p=>{const acc=accounts.find(a=>a.id===currentUser.id);return acc?.accessibleProps?.[p.id];}) : properties}
+          currentUser={currentUser}/>}
+        {tab==="inventory"  &&isInventory&&<InventoryManagerView inventory={inventory} properties={properties} currentUser={currentUser} accounts={accounts}/>}
+        {tab==="inventory"  &&!isInventory&&<InventoryView inventory={inventory} properties={properties} currentUser={currentUser}/>}
+        {tab==="team"       &&isOwner&&<TeamView currentUser={currentUser} accounts={accounts} section={section} properties={properties}/>}
       </div>
     </div>
   </DbCtx.Provider>;
@@ -3213,7 +3411,7 @@ function JobsView({jobs,properties,accounts,currentUser}) {
   const deleteJob = async (jobId) => {
     await Promise.all([
       db.ref(`jobs/${jobId}`).remove(),
-      db.ref(`jobPhotos/${jobId}`).remove(),
+      db.ref(`jobVideos/${jobId}`).remove(),
     ]);
     setShowModal(null); setConfirmDelete(false);
   };

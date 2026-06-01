@@ -376,41 +376,59 @@ exports.onJobOverdue = functions.database.ref("/jobs/{jobId}/overdueAlertSent").
   console.log(`[onJobOverdue] OVERDUE alert sent — ${prop.name}`);
 });
 
-// ─── PHOTOS ──────────────────────────────────────────────────────────────────
+// ─── VIDEOS ──────────────────────────────────────────────────────────────────
 
-exports.onPhotoUploaded = functions.database.ref("/jobPhotos/{jobId}/{photoId}").onCreate(async (snap, ctx) => {
-  const photo = snap.val();
-  if (!photo) return;
+exports.onVideoUploaded = functions.database.ref("/jobVideos/{jobId}/{type}").onCreate(async (snap, ctx) => {
+  const video = snap.val();
+  if (!video) return;
 
-  // Look up the job to find property
-  const jobSnap = await db.ref(`jobs/${ctx.params.jobId}`).once("value");
+  const { jobId, type } = ctx.params;
+
+  const jobSnap = await db.ref(`jobs/${jobId}`).once("value");
   const job     = jobSnap.val();
   if (!job) return;
 
   const prop      = await getProp(job.propertyId);
-  const isAfter   = photo.type === "after";
+  const isAfter   = type === "after";
   const dateShort = fmtCheckoutShort(job.checkoutDate);
 
+  // Check if both videos now exist so we can flag it in the notification
+  const videosSnap = await db.ref(`jobVideos/${jobId}`).once("value");
+  const allVideos  = videosSnap.val() || {};
+  const bothReady  = !!(allVideos.before && allVideos.after);
+
   const subject = isAfter
-    ? `✅ After-Clean Photo — ${prop.name}${dateShort ? ` · ${dateShort}` : ""}`
-    : `📷 Before-Clean Photo — ${prop.name}${dateShort ? ` · ${dateShort}` : ""}`;
+    ? `🎥 After-Clean Video — ${prop.name}${dateShort ? ` · ${dateShort}` : ""}`
+    : `📹 Before-Clean Video — ${prop.name}${dateShort ? ` · ${dateShort}` : ""}`;
 
   const html = emailHtml({
     subject,
-    badge:      isAfter ? "After Clean" : "Before Clean",
+    badge:      isAfter ? "After Clean Video" : "Before Clean Video",
     badgeColor: isAfter ? "#059669" : "#D97706",
     rows: [
       row("Property",      prop.name),
       row("Checkout Date", `<strong>${fmtCheckout(job.checkoutDate)}</strong>`),
-      actionRow("Uploaded by", photo.uploadedBy),
-      row("Photo Type",    isAfter ? "After clean" : "Before clean"),
-      row("Uploaded",      fmtDate(photo.uploadedAt)),
+      actionRow("Uploaded by", video.uploadedBy),
+      row("Video Type",    isAfter ? "After clean walkthrough" : "Before clean walkthrough"),
+      row("Uploaded",      fmtDate(video.uploadedAt)),
+      ...(bothReady ? [row("Status", "✅ Both walkthroughs uploaded — ready for review")] : []),
     ],
-    note: "Photo is stored in the app. Open the calendar to view the full image.",
-    cta:  tabLink("calendar", "View in Calendar"),
+    note: bothReady
+      ? "Both before and after walkthrough videos have been uploaded. Open the app to review."
+      : `The ${isAfter ? "before" : "after"} walkthrough is still pending.`,
+    cta:  tabLink("calendar", "View in App"),
   });
 
   await sendEmail(subject, html);
+});
+
+exports.onJobDeleted = functions.database.ref("/jobs/{jobId}").onDelete(async (snap, ctx) => {
+  const jobId  = ctx.params.jobId;
+  const bucket = admin.storage().bucket("bluerock-property-management.firebasestorage.app");
+  const [files] = await bucket.getFiles({ prefix: `videos/${jobId}/` });
+  if (!files.length) return;
+  await Promise.all(files.map(f => f.delete()));
+  console.log(`[onJobDeleted] Deleted ${files.length} video file(s) from Storage for job ${jobId}`);
 });
 
 // ─── INVENTORY ───────────────────────────────────────────────────────────────
@@ -437,6 +455,13 @@ exports.onInventoryItemCreated = functions.database.ref("/inventory/{propId}/{it
   });
 
   await sendEmail(subject, html);
+
+  // Notify inventory managers who have access to this property
+  const propId = ctx.params.propId;
+  const accsSnap = await db.ref("accounts").orderByChild("role").equalTo("inventory").once("value");
+  const invMgrs  = Object.values(accsSnap.val() || {});
+  const mgrsWithAccess = invMgrs.filter(a => a.authorized && a.accessibleProps && a.accessibleProps[propId]);
+  await Promise.all(mgrsWithAccess.map(mgr => notifyCleanerAccount(mgr, subject, html)));
 });
 
 exports.onInventoryItemUpdated = functions.database.ref("/inventory/{propId}/{itemId}").onUpdate(async (change, ctx) => {
@@ -508,6 +533,12 @@ exports.onMaintenanceCreated = functions.database.ref("/maintenance/{ticketId}")
   });
 
   await sendEmail(subject, html);
+
+  // Notify inventory managers who have access to this property
+  const accsSnap = await db.ref("accounts").orderByChild("role").equalTo("inventory").once("value");
+  const invMgrs  = Object.values(accsSnap.val() || {});
+  const mgrsWithAccess = invMgrs.filter(a => a.authorized && a.accessibleProps && a.accessibleProps[ticket.propertyId]);
+  await Promise.all(mgrsWithAccess.map(mgr => notifyCleanerAccount(mgr, subject, html)));
 });
 
 exports.onMaintenanceUpdated = functions.database.ref("/maintenance/{ticketId}").onUpdate(async (change) => {
